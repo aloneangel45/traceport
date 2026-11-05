@@ -1,0 +1,7 @@
+*.exe
+*.dll
+*.so
+*.dylib
+.traceport/
+dist/
+build/
