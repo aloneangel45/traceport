@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Create dist directory
+        run: mkdir -p dist
+
+      - name: Build and Package Windows amd64
+        env:
+          CGO_ENABLED: 0
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/traceport-windows-amd64.exe ./cmd/traceport
+          cd dist && zip traceport-windows-amd64.zip traceport-windows-amd64.exe && rm traceport-windows-amd64.exe && cd ..
+
+      - name: Build and Package Linux amd64
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/traceport-linux-amd64 ./cmd/traceport
+          tar -czvf dist/traceport-linux-amd64.tar.gz -C dist traceport-linux-amd64
+          rm dist/traceport-linux-amd64
+
+      - name: Build and Package Linux arm64
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/traceport-linux-arm64 ./cmd/traceport
+          tar -czvf dist/traceport-linux-arm64.tar.gz -C dist traceport-linux-arm64
+          rm dist/traceport-linux-arm64
+
+      - name: Build and Package macOS amd64
+        env:
+          CGO_ENABLED: 0
+          GOOS: darwin
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/traceport-darwin-amd64 ./cmd/traceport
+          tar -czvf dist/traceport-darwin-amd64.tar.gz -C dist traceport-darwin-amd64
+          rm dist/traceport-darwin-amd64
+
+      - name: Build and Package macOS arm64
+        env:
+          CGO_ENABLED: 0
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/traceport-darwin-arm64 ./cmd/traceport
+          tar -czvf dist/traceport-darwin-arm64.tar.gz -C dist traceport-darwin-arm64
+          rm dist/traceport-darwin-arm64
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum traceport-windows-amd64.zip \
+                    traceport-linux-amd64.tar.gz \
+                    traceport-linux-arm64.tar.gz \
+                    traceport-darwin-amd64.tar.gz \
+                    traceport-darwin-arm64.tar.gz > checksums.txt
+          cd ..
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/traceport-windows-amd64.zip
+            dist/traceport-linux-amd64.tar.gz
+            dist/traceport-linux-arm64.tar.gz
+            dist/traceport-darwin-amd64.tar.gz
+            dist/traceport-darwin-arm64.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true

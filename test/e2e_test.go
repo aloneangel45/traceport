@@ -2,6 +2,7 @@ package test
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 
 	"github.com/aloneangel45/traceport/pkg/recorder"
@@ -19,7 +20,14 @@ func TestTracePort_LiveRecordAndReplay(t *testing.T) {
 	runner := recorder.NewRunner(store, tmpDir)
 
 	// Record a real command execution
-	session, err := runner.Record("cmd.exe", []string{"/c", "echo", "HELLO_TRACEPORT_TEST"})
+	cmdName := "cmd.exe"
+	cmdArgs := []string{"/c", "echo", "HELLO_TRACEPORT_TEST"}
+	if runtime.GOOS != "windows" {
+		cmdName = "sh"
+		cmdArgs = []string{"-c", "echo HELLO_TRACEPORT_TEST"}
+	}
+
+	session, err := runner.Record(cmdName, cmdArgs)
 	if err != nil {
 		t.Fatalf("record failed: %v", err)
 	}
