@@ -1,4 +1,4 @@
-# 🛰️ TracePort
+# TracePort
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/aloneangel45/traceport/main/assets/banner.png" alt="TracePort Banner" width="700" onerror="this.style.display='none'"/>
@@ -19,7 +19,7 @@
 
 ---
 
-## ⚡ The Problem: The $40 Broken Agent Loop
+## The Problem: The $40 Broken Agent Loop
 
 Autonomous coding agents (Claude Code, Cursor, Aider, OpenHands) execute multi-step workflows across 15–20 consecutive steps:
 1. When an agent crashes or makes a wrong edit at **step 14**, you are forced to re-run the entire workflow from step 1.
@@ -34,7 +34,7 @@ Autonomous coding agents (Claude Code, Cursor, Aider, OpenHands) execute multi-s
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
@@ -57,7 +57,7 @@ Autonomous coding agents (Claude Code, Cursor, Aider, OpenHands) execute multi-s
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -71,7 +71,7 @@ go build -o traceport.exe ./cmd/traceport
 
 ---
 
-## 💻 Usage
+## Usage
 
 ### 1. Record an Agent Execution
 Wrap any agent or CLI command with `traceport record -- <command>`:
@@ -114,7 +114,7 @@ traceport replay trace_17939077467428723
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the [MIT License](LICENSE).  
 Authored by [aloneangel45](https://github.com/aloneangel45).
