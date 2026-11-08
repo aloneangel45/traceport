@@ -106,8 +106,8 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 		}
 	}()
 
-	cmdErr := cmd.Wait()
 	wg.Wait()
+	cmdErr := cmd.Wait()
 
 	completedSession, err := r.store.GetSession(sessionID)
 	if err != nil {
