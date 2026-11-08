@@ -10,6 +10,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/aloneangel45/traceport/actions/workflows/ci.yml"><img src="https://github.com/aloneangel45/traceport/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
+  <a href="https://github.com/aloneangel45/traceport/releases"><img src="https://img.shields.io/github/v/release/aloneangel45/traceport?style=flat-square" alt="Release"/></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go" alt="Go Version"/></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License: MIT"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat-square" alt="Cross-Platform"/></a>
@@ -59,9 +61,27 @@ Autonomous coding agents (Claude Code, Cursor, Aider, OpenHands) execute multi-s
 
 ## Quick Start
 
-### Installation
+### Pre-Compiled Binaries
 
-Compile directly from source with Go:
+Download pre-compiled binaries for Windows, Linux, and macOS from the [Releases](https://github.com/aloneangel45/traceport/releases) page:
+
+```bash
+# macOS / Linux (via curl)
+curl -fsSL https://github.com/aloneangel45/traceport/releases/latest/download/traceport-linux-amd64.tar.gz | tar -xz
+sudo mv traceport-linux-amd64 /usr/local/bin/traceport
+
+# Windows (PowerShell)
+Invoke-WebRequest -Uri https://github.com/aloneangel45/traceport/releases/latest/download/traceport-windows-amd64.zip -OutFile traceport.zip
+Expand-Archive traceport.zip -DestinationPath .
+```
+
+### Go Install
+
+```bash
+go install github.com/aloneangel45/traceport/cmd/traceport@latest
+```
+
+### Build from Source
 
 ```bash
 git clone https://github.com/aloneangel45/traceport.git
