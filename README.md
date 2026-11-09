@@ -11,13 +11,37 @@
 
 <p align="center">
   <a href="https://github.com/aloneangel45/traceport/actions/workflows/ci.yml"><img src="https://github.com/aloneangel45/traceport/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
-  <a href="https://github.com/aloneangel45/traceport/releases"><img src="https://img.shields.io/github/v/release/aloneangel45/traceport?style=flat-square" alt="Release"/></a>
+  <a href="https://github.com/aloneangel45/traceport/releases"><img src="https://img.shields.io/github/v/release/aloneangel45/traceport?style=flat-square&color=blue" alt="Release"/></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go" alt="Go Version"/></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License: MIT"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat-square" alt="Cross-Platform"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Replay%20Cost-$0%20(Zero--Token)-brightgreen?style=flat-square" alt="Zero Token Replay"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Git-Shadow%20Tree%20Rollback-orange?style=flat-square" alt="Git Rollback"/></a>
 </p>
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🛰️ traceport record -- aider --model claude-3-7-sonnet                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ [Flight WAL]    Live telemetry streaming to .traceport/wal_098.jsonl        │
+│ [Git Savepoint] Step 11: Created shadow write-tree sha (tree: 9a8c1f...)   │
+│ [Agent Error]   Step 14: Failed with syntax error in auth_middleware.go     │
+│ ─────────────────────────────────────────────────────────────────────────── │
+│ ⏪ traceport rewind trace_17939077467428723 --step 11                       │
+│ [Rewind Engine] Restored 4 workspace files to Step 11 snapshot in 12ms!     │
+│ 💸 Cost Avoided: Saved $18.40 and 15 mins of re-run inference               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### ⚡ One-Line Install
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/aloneangel45/traceport/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/aloneangel45/traceport/main/install.ps1 | iex
+```
 
 ---
 
@@ -59,29 +83,41 @@ Autonomous coding agents (Claude Code, Cursor, Aider, OpenHands) execute multi-s
 
 ---
 
-## Quick Start
+## Installation & Quick Start
 
-### Pre-Compiled Binaries
+### 1. Automated One-Line Install (Recommended)
 
-Download pre-compiled binaries for Windows, Linux, and macOS from the [Releases](https://github.com/aloneangel45/traceport/releases) page:
+Automatically detects your platform, downloads the verified binary release from GitHub, and configures your PATH:
 
+**macOS & Linux (Bash / Zsh):**
 ```bash
-# macOS / Linux (via curl)
-curl -fsSL https://github.com/aloneangel45/traceport/releases/latest/download/traceport-linux-amd64.tar.gz | tar -xz
-sudo mv traceport-linux-amd64 /usr/local/bin/traceport
-
-# Windows (PowerShell)
-Invoke-WebRequest -Uri https://github.com/aloneangel45/traceport/releases/latest/download/traceport-windows-amd64.zip -OutFile traceport.zip
-Expand-Archive traceport.zip -DestinationPath .
+curl -fsSL https://raw.githubusercontent.com/aloneangel45/traceport/main/install.sh | bash
 ```
 
-### Go Install
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/aloneangel45/traceport/main/install.ps1 | iex
+```
+
+---
+
+### 2. Pre-Compiled Binaries
+
+Download native pre-compiled binaries directly from the [Releases](https://github.com/aloneangel45/traceport/releases) page for Windows, Linux, and macOS.
+
+---
+
+### 3. Via `go install`
+
+Requires Go 1.22+:
 
 ```bash
 go install github.com/aloneangel45/traceport/cmd/traceport@latest
 ```
 
-### Build from Source
+---
+
+### 4. Build from Source
 
 ```bash
 git clone https://github.com/aloneangel45/traceport.git
