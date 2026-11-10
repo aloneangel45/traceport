@@ -10,11 +10,13 @@ jobs:
   test:
     name: Test (${{ matrix.os }} - Go ${{ matrix.go-version }})
     runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: 0
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        go-version: ['1.24.x', '1.23.x']
+        go-version: ['1.27.x', '1.26.x', '1.25.x']
 
     steps:
       - name: Checkout repository
