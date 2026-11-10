@@ -645,6 +645,9 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 
 	targetMap := make(map[string]FileEntry, len(manifest.Files))
 	for _, e := range manifest.Files {
+		if _, err := ts.safeTargetPathLocked(e.Path, false); err != nil {
+			return nil, err
+		}
 		targetMap[e.Path] = e
 	}
 
@@ -662,7 +665,9 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 		if err != nil {
 			return nil, err
 		}
-		_ = os.Chmod(targetPath, 0600)
+		if linfo, lerr := os.Lstat(targetPath); lerr == nil && linfo.Mode()&os.ModeSymlink == 0 {
+			_ = os.Chmod(targetPath, 0600)
+		}
 		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("remove post-checkpoint file %s: %w", rel, err)
 		}
