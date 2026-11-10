@@ -5,172 +5,233 @@
 </p>
 
 <p align="center">
-  <strong>Black-Box Flight Recorder, Deterministic Replay Engine & Time-Travel Debugger for AI Agents & CLI Tools.</strong><br>
-  Capture multi-step agent executions, rollback workspace savepoints to any failure step, and replay sessions with <strong>0 tokens and 0ms latency</strong>.
+  <strong>Deterministic Flight Recorder, Zstandard Shadow-Tree Engine & Time-Travel Debugger for AI Agents and CLI Workflows.</strong><br>
+  Capture continuous multi-step agent executions, inspect filesystem diffs across steps, and roll back workspace state in milliseconds with zero LLM token overhead.
 </p>
 
 <p align="center">
   <a href="https://github.com/aloneangel45/traceport/actions/workflows/ci.yml"><img src="https://github.com/aloneangel45/traceport/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
   <a href="https://github.com/aloneangel45/traceport/releases"><img src="https://img.shields.io/github/v/release/aloneangel45/traceport?style=flat-square&color=blue" alt="Release"/></a>
-  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go" alt="Go Version"/></a>
+  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go" alt="Go Version"/></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License: MIT"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=flat-square" alt="Cross-Platform"/></a>
-  <a href="#"><img src="https://img.shields.io/badge/Replay%20Cost-$0%20(Zero--Token)-brightgreen?style=flat-square" alt="Zero Token Replay"/></a>
-  <a href="#"><img src="https://img.shields.io/badge/Git-Shadow%20Tree%20Rollback-orange?style=flat-square" alt="Git Rollback"/></a>
+  <a href="#"><img src="https://img.shields.io/badge/Snapshots-Zstd%20Shadow%20Trees-007ec6?style=flat-square" alt="Zstd Shadow Trees"/></a>
 </p>
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 🛰️ traceport record -- aider --model claude-3-7-sonnet                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ [Flight WAL]    Live telemetry streaming to .traceport/wal_098.jsonl        │
-│ [Git Savepoint] Step 11: Created shadow write-tree sha (tree: 9a8c1f...)   │
-│ [Agent Error]   Step 14: Failed with syntax error in auth_middleware.go     │
-│ ─────────────────────────────────────────────────────────────────────────── │
-│ ⏪ traceport rewind trace_17939077467428723 --step 11                       │
-│ [Rewind Engine] Restored 4 workspace files to Step 11 snapshot in 12ms!     │
-│ 💸 Cost Avoided: Saved $18.40 and 15 mins of re-run inference               │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+$ traceport record -- aider --model claude-sonnet-4-5
+[traceport] recording command: aider --model claude-sonnet-4-5
+  step 01  checkpoint   Initial workspace snapshot [tree:84c1e9a04b12]
+  step 08  checkpoint   Intermediate workspace snapshot [tree:2f91b7d4c083]
+  step 14  error        syntax error in pkg/auth/middleware.go
+[err] session trace_1794348120984102 aborted (exit=1, frames=15)
 
-### ⚡ One-Line Install
+$ traceport diff trace_1794348120984102 --from 8 --to 15
+--- a/pkg/auth/middleware.go
++++ b/pkg/auth/middleware.go
+...
 
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/aloneangel45/traceport/main/install.sh | bash
-
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/aloneangel45/traceport/main/install.ps1 | iex
+$ traceport rewind trace_1794348120984102 --step 8
+[ok] pre-rewind safety savepoint created: 91e04ad8721b553f
+[ok] rewound session trace_1794348120984102 to step 8 (restored=2, deleted=1, skipped=31)
 ```
 
 ---
 
-## The Problem: The $40 Broken Agent Loop
+## Overview
 
-Autonomous coding agents (Claude Code, Cursor, Aider, OpenHands) execute multi-step workflows across 15–20 consecutive steps:
-1. When an agent crashes or makes a wrong edit at **step 14**, you are forced to re-run the entire workflow from step 1.
-2. Every re-run burns another **$5–$40 in LLM API tokens** and wastes 10+ minutes.
-3. Traditional debuggers cannot step backward in non-deterministic agent workflows or undo local workspace mutations without tedious manual git stashing.
+Autonomous coding agents execute multi-step workflows that mutate dozens of files across consecutive tool calls. When an agent introduces a regression or crashes mid-run, restarting from scratch wastes inference tokens, wall-clock time, and clean intermediate state.
 
-**TracePort solves this by acting as an immutable flight recorder:**
-* 📹 **Black-Box Flight Recording:** Intercepts inputs, outputs, tool invocations, and workspace mutations frame-by-frame.
-* ⏪ **Time-Travel Rewind:** Roll back your workspace files and session timeline to the exact step before failure (`traceport rewind <id> --step 11`).
-* 🔁 **Zero-Token Deterministic Replay:** Replays past executions directly from recorded frames without making additional LLM API calls.
-* 🌳 **Git-Backed Shadow Trees:** Uses instant git write-trees to capture workspace savepoints without polluting your git commit history.
+TracePort wraps any CLI or agent process in a pure-Go (`CGO_ENABLED=0`) flight recorder:
+
+- **Zstandard Content-Addressed Shadow Trees:** Captures initial, intermediate, and final workspace snapshots in any directory (Git or non-Git) without mutating `.git/index` or polluting commit history.
+- **Dictionary-Accelerated Small-File Compression:** Ships with a deterministic multi-language Zstandard dictionary (`DefaultSourceDict`) for zero-cold-start compression on source files, plus `traceport dict train` for repository-specific `.zdict` training.
+- **Incremental Stat Cache:** Indexes `(mtime, size, mode) -> sha256` so unchanged files incur zero disk reads and zero re-compression during high-frequency polling (~0.56 ms scan across 32 files).
+- **Safe Delta Time-Travel Rewind:** Automatically records a pre-rewind safety savepoint before modifying the workspace, supports `--dry-run` previews, guards against cross-repository rewinds, skips unchanged files on disk, and removes post-checkpoint stray files while preserving `.git` and `.traceport`.
+- **Append-Only JSONL Frame Log:** Streams arbitrarily large stdout/stderr payloads (>1 MiB single lines) in `O(1)` append operations (`<id>.frames.jsonl`) alongside atomic metadata (`<id>.meta.json`).
+- **Cryptographic Integrity & Garbage Collection:** Built-in `verify` (SHA-256 manifest + blob verification), `diff` (pure-Go unified diff), and `gc` (session pruning and unreferenced blob sweeping).
 
 ---
 
 ## Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│                    TracePort Flight CLI                      │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-            ┌──────────────────┴──────────────────┐
-            ▼                                     ▼
-   ┌─────────────────┐                   ┌─────────────────┐
-   │ Flight Recorder │                   │  Replay Engine  │
-   │ (Tee I/O Inter) │                   │ (Time-Travel)   │
-   └────────┬────────┘                   └────────┬────────┘
-            │                                     │
-            ▼                                     ▼
- ┌──────────────────────┐             ┌──────────────────────┐
- │ Git Shadow Savepoint │             │ JSONL Session Store  │
- │ (Zero Dirty Commits) │             │ (Append-Only WAL)    │
- └──────────────────────┘             └──────────────────────┘
++------------------------------------------------------------------------+
+|                           traceport CLI                                |
+|     record | sessions | inspect | diff | rewind | replay | verify      |
++-------------------+--------------------------------+-------------------+
+                    |                                |
+                    v                                v
+        +-----------------------+        +-----------------------+
+        |    Flight Recorder    |        |   Time-Travel Engine  |
+        |  Chunked Pipe Stream  |        |  Delta Restore / Diff |
+        |  Signal Forwarding    |        |  Verify / Blob GC     |
+        +-----------+-----------+        +-----------+-----------+
+                    |                                |
+        +-----------+------------+-------------------+-----------+
+        |                        |                               |
+        v                        v                               v
++---------------+    +-----------------------+    +----------------------+
+| Session Store |    | Zstd Shadow-Tree CAS  |    | Dictionary Registry  |
+| .meta.json    |    | blobs/<xx>/<sha>.zst  |    | DefaultSourceDict +  |
+| .frames.jsonl |    | trees/<hash>.manifest |    | dicts/dict_*.zdict   |
++---------------+    +-----------------------+    +----------------------+
+```
+
+### Storage Layout
+
+TracePort resolves its store directory in order: `TRACEPORT_HOME` environment variable, nearest workspace `.traceport/` or `.git` root (`<repo>/.traceport`), or the OS user configuration directory.
+
+```text
+.traceport/
+  sessions/
+    trace_<id>.meta.json          # Atomic session metadata (0600)
+    trace_<id>.frames.jsonl       # O(1) append-only telemetry stream (0600)
+  blobs/
+    <sha[:2]>/<sha[2:]>.zst       # Deduplicated Zstd-compressed file blobs (0600)
+  trees/
+    <treeHash>.manifest.zst       # Content-addressed Zstd tree manifests (0600)
+    stat_cache.json               # Incremental (mtime, size, mode) -> sha256 index
+  dicts/
+    dict_<id>.zdict               # Trained workspace Zstandard dictionaries (0600)
+    active                        # Active encoder dictionary pointer
 ```
 
 ---
 
-## Installation & Quick Start
+## Benchmarks
 
-### 1. Automated One-Line Install (Recommended)
+Measured via `CGO_ENABLED=0 go test -bench=. -benchmem ./pkg/checkpoint/...` on AMD Ryzen 9 8945HX (`windows/amd64`, Go 1.27, NTFS) over a 5-step multi-language workspace trajectory (32 source files across Go, Python, TypeScript, and YAML; ~77.9 KB cumulative logical snapshot payload) followed by a delta rollback to step 2:
 
-Automatically detects your platform, downloads the verified binary release from GitHub, and configures your PATH:
+| Storage Backend | Stored Bytes / 5 Steps | Space Ratio (`ratio_pct`) | Delta Rollback (`rollback_us/op`) | Notes |
+| :--- | ---: | ---: | ---: | :--- |
+| `PureGoSQLiteWAL` | `193,672 B` | `248.6%` | `8,343 us` | 4 KiB WAL page framing + CRC32 headers |
+| `Uncompressed` (CAS) | `40,540 B` | `52.04%` | `2,225 us` | SHA-256 deduplicated raw blobs + raw JSON manifests |
+| `ZstdRaw` (`SpeedFastest`) | `20,008 B` | `25.68%` | `2,497 us` | Deduplicated Zstd blobs, no dictionary |
+| **`ZstdDict` (`SpeedFastest`)** | **`10,846 B`** | **`13.92%`** | **`2,828 us`** | **Deduplicated Zstd + trained workspace `.zdict` (17.8x smaller than paged WAL)** |
 
-**macOS & Linux (Bash / Zsh):**
+Additional microbenchmarks on the same host:
+- **Unchanged 32-file workspace checkpoint (`BenchmarkIncrementalStatCache_Unchanged`):** `557 us/op` (`0` file reads, `0` blob compressions).
+- **Small Go file compression (`BenchmarkCompressorSmallSource`):** `ZstdDict` achieves `69.9%` ratio vs `77.3%` for raw `ZstdRaw` on sub-kilobyte snippets.
+
+---
+
+## Installation
+
+### 1. Verified One-Line Install
+
+Downloads the platform archive and `checksums.txt`, verifies the SHA-256 digest before extraction, and installs `traceport`:
+
 ```bash
+# Linux & macOS (amd64 / arm64)
 curl -fsSL https://raw.githubusercontent.com/aloneangel45/traceport/main/install.sh | bash
 ```
 
-**Windows (PowerShell):**
 ```powershell
+# Windows PowerShell (amd64 / arm64)
 irm https://raw.githubusercontent.com/aloneangel45/traceport/main/install.ps1 | iex
 ```
 
----
+### 2. Pre-Compiled Release Archives
 
-### 2. Pre-Compiled Binaries
+Download release binaries and `checksums.txt` from [GitHub Releases](https://github.com/aloneangel45/traceport/releases) (`windows/amd64`, `windows/arm64`, `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`).
 
-Download native pre-compiled binaries directly from the [Releases](https://github.com/aloneangel45/traceport/releases) page for Windows, Linux, and macOS.
-
----
-
-### 3. Via `go install`
-
-Requires Go 1.22+:
+### 3. Build from Source (`Go 1.25+`)
 
 ```bash
 go install github.com/aloneangel45/traceport/cmd/traceport@latest
 ```
 
----
-
-### 4. Build from Source
+Or build locally without CGo:
 
 ```bash
 git clone https://github.com/aloneangel45/traceport.git
 cd traceport
-go build -o traceport.exe ./cmd/traceport
+CGO_ENABLED=0 go build -trimpath -o traceport ./cmd/traceport
 ```
 
 ---
 
-## Usage
+## CLI Reference
 
-### 1. Record an Agent Execution
-Wrap any agent or CLI command with `traceport record -- <command>`:
+### Record an Execution Session
 
 ```bash
-# Record an agent running a task
-traceport record -- claude code "Refactor the authentication middleware"
-
-# Record a test suite execution
+traceport record -- claude code "Refactor authentication middleware"
 traceport record -- go test ./...
 ```
 
-### 2. List Recorded Flights
+Child exit codes and `SIGINT`/`SIGTERM` termination states are preserved and propagated to the caller.
+
+### List & Inspect Sessions
+
 ```bash
-traceport list
-```
-Output:
-```text
-SESSION ID               STATUS       FRAMES   STARTED              COMMAND
-────────────────────────────────────────────────────────────────────────────────
-trace_17939077467428723  completed    18       2026-11-05 22:42:26  claude code Refactor...
+traceport sessions
+traceport list --json
+traceport inspect <session_id>
+traceport inspect <session_id> --json
 ```
 
-### 3. Inspect Telemetry & Step Breakdown
+### Unified Checkpoint Diff
+
+Compare any two recorded steps, or compare a step against the current live working tree:
+
 ```bash
-traceport inspect trace_17939077467428723
+# Diff step 1 against live working tree
+traceport diff <session_id>
+
+# Diff step 2 against step 7
+traceport diff <session_id> --from 2 --to 7
+
+# Structured JSON diff report
+traceport diff <session_id> --from 2 --to 7 --json
 ```
 
-### 4. Rewind to Step N
-Roll back both the agent execution state and your local workspace files to step 11:
+### Time-Travel Rewind
+
+Preview or execute delta workspace restoration to step `N`. Before modifying any files, TracePort captures an automatic safety savepoint of uncommitted workspace state:
+
 ```bash
-traceport rewind trace_17939077467428723 --step 11
+# Preview creations, modifications, and deletions without touching disk
+traceport rewind <session_id> --step 5 --dry-run
+
+# Roll back workspace and session timeline to step 5
+traceport rewind <session_id> --step 5
+
+# Override cross-workspace directory guard if intentionally restoring elsewhere
+traceport rewind <session_id> --step 5 --force
 ```
 
-### 5. Deterministic Zero-Token Replay
-Replay the session output in your terminal at zero token cost:
+### Deterministic Zero-Token Replay
+
 ```bash
-traceport replay trace_17939077467428723
+traceport replay <session_id>
+traceport replay <session_id> --from 4
+```
+
+### Train Workspace Zstandard Dictionary
+
+Scan repository source files (automatically skipping `.git`, `.traceport`, `node_modules`, `vendor`, `dist`, and binaries) to train an optimized `.zdict` dictionary:
+
+```bash
+traceport dict train
+traceport dict train --json
+```
+
+### Cryptographic Verification & Garbage Collection
+
+```bash
+# Verify SHA-256 digests of all session logs, Zstd manifests, and blobs
+traceport verify
+traceport verify <session_id> --json
+
+# Preview or execute garbage collection (retain newest 10 sessions, sweep orphan blobs)
+traceport gc --keep 10 --dry-run
+traceport gc --keep 10
 ```
 
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).  
-Authored by [aloneangel45](https://github.com/aloneangel45).
+Released under the [MIT License](LICENSE). Authored by [aloneangel45](https://github.com/aloneangel45).

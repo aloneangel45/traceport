@@ -1,11 +1,11 @@
 # Contributing to TracePort
 
-Thank you for your interest in contributing to **TracePort**! We welcome bug reports, feature suggestions, documentation updates, and pull requests.
+Thank you for contributing to TracePort. Bug reports, architecture proposals, benchmark improvements, and pull requests are welcome.
 
 ## Development Workflow
 
 ### Prerequisites
-- **Go 1.22+**
+- Go 1.25+ (`CGO_ENABLED=0` compatible)
 - Git
 
 ### Setup
@@ -15,21 +15,21 @@ Thank you for your interest in contributing to **TracePort**! We welcome bug rep
    git clone https://github.com/YOUR_USERNAME/traceport.git
    cd traceport
    ```
-3. Create a descriptive feature or bugfix branch:
+3. Create a feature or fix branch:
    ```bash
    git checkout -b feat/your-feature-name
    ```
 
-### Running Tests & Linting
-Ensure all tests pass and formatting is clean:
+### Running Verification & Benchmarks
+All packages must build and pass tests with `CGO_ENABLED=0`:
 ```bash
-go test -v ./...
-go vet ./...
+CGO_ENABLED=0 go vet ./...
+CGO_ENABLED=0 go test -v ./...
+CGO_ENABLED=0 go test -bench=. -benchmem ./pkg/checkpoint/...
 gofmt -s -w .
 ```
 
 ### Pull Request Guidelines
-- Keep pull requests focused on a single change or feature.
-- Ensure your branch is rebased on the latest `main`.
-- Fill out the Pull Request template completely.
-- Verify all CI checks pass.
+- Keep pull requests focused on a well-defined change.
+- Use Conventional Commits (`feat:`, `fix:`, `perf:`, `docs:`, `test:`).
+- Ensure `go vet ./...` and `go test ./...` pass across Linux, macOS, and Windows.
