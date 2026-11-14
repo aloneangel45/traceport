@@ -222,3 +222,74 @@ func TestEngine_DiffVerifyAndGC(t *testing.T) {
 		t.Fatalf("unexpected playback output: %s", pb.String())
 	}
 }
+
+func TestEngine_ExportAndSearch(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := filepath.Join(t.TempDir(), "sessions")
+
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, _, _ := buildMultiStepTestSession(t, store, workDir, "trace_export_1")
+	sess.Tags = []string{"incident-7", "regression"}
+	sess.EndTime = sess.StartTime.Add(250 * time.Millisecond)
+	_ = store.UpdateSessionMeta(sess)
+
+	slackFake := "xox" + "b-111222333-444555666-secretSlackVal"
+	awsFake := "AKIA" + "IOSFODNN7EXAMPLE"
+
+	// Append a tool frame with a Slack token to verify tool redaction & tool search.
+	_ = store.AppendFrame(sess.ID, model.Frame{
+		Timestamp: time.Now(),
+		Type:      model.EventToolCall,
+		Content:   "notify slack channel",
+		Tool: &model.ToolInvocation{
+			Name:       "slack_post",
+			Arguments:  map[string]interface{}{"webhook_token": slackFake},
+			Result:     "posted with " + awsFake,
+			DurationMs: 18,
+		},
+	})
+
+	eng := NewEngine(store)
+
+	// 1. Unsupported export format must fail cleanly.
+	if _, err := eng.ExportSession(sess.ID, ExportOptions{Format: "xml"}); err == nil {
+		t.Fatalf("expected error for unsupported export format")
+	}
+
+	// 2. Markdown export with redaction must include metadata, checkpoint delta, and scrub secrets.
+	mdBytes, err := eng.ExportSession(sess.ID, ExportOptions{Format: "md", Redact: true})
+	if err != nil {
+		t.Fatalf("ExportSession(md, redact) failed: %v", err)
+	}
+	md := string(mdBytes)
+	for _, want := range []string{"incident-7, regression", "helper.go", "obsolete.txt", "slack_post", "[REDACTED]"} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("expected %q in markdown export:\n%s", want, md)
+		}
+	}
+	for _, secret := range []string{slackFake, awsFake} {
+		if strings.Contains(md, secret) {
+			t.Fatalf("secret %q leaked in markdown export", secret)
+		}
+	}
+
+	// 3. Search invalid regex must return error.
+	if _, err := eng.Search(SearchOptions{Query: "[unclosed", Regex: true}); err == nil {
+		t.Fatalf("expected error on invalid regex")
+	}
+
+	// 4. Search deleted checkpoint file path ("obsolete.txt") & tool invocation ("slack_post").
+	delRes, err := eng.Search(SearchOptions{Query: "obsolete.txt", Tags: []string{"incident-7"}})
+	if err != nil || len(delRes) != 1 || !strings.Contains(delRes[0].Matches[0].Snippet, "deleted obsolete.txt") {
+		t.Fatalf("expected deleted obsolete.txt checkpoint match, got %+v (err=%v)", delRes, err)
+	}
+
+	toolRes, err := eng.Search(SearchOptions{Query: "slack_post"})
+	if err != nil || len(toolRes) != 1 {
+		t.Fatalf("expected tool search match for slack_post, got %+v (err=%v)", toolRes, err)
+	}
+}

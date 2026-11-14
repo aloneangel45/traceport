@@ -49,6 +49,7 @@ TracePort wraps any CLI or agent process in a pure-Go (`CGO_ENABLED=0`) flight r
 - **Incremental Stat Cache:** Indexes `(mtime, size, mode) -> sha256` so unchanged files incur zero disk reads and zero re-compression during high-frequency polling (~0.56 ms scan across 32 files).
 - **Safe Delta Time-Travel Rewind:** Automatically records a pre-rewind safety savepoint before modifying the workspace, supports `--dry-run` previews, guards against cross-repository rewinds, skips unchanged files on disk, and removes post-checkpoint stray files while preserving `.git` and `.traceport`.
 - **Append-Only JSONL Frame Log:** Streams arbitrarily large stdout/stderr payloads (>1 MiB single lines) in `O(1)` append operations (`<id>.frames.jsonl`) alongside atomic metadata (`<id>.meta.json`).
+- **Session Tagging, Cross-Session Search & Redacted Exports:** Tag flights at record time or post-hoc (`--tag`, `traceport tag`), search across commands, stderr/stdout frames, tool calls, and checkpoint file mutations (`traceport search`), and export portable JSON fixtures or Markdown audit reports with built-in credential scrubbing (`traceport export --redact`).
 - **Cryptographic Integrity & Garbage Collection:** Built-in `verify` (SHA-256 manifest + blob verification), `diff` (pure-Go unified diff), and `gc` (session pruning and unreferenced blob sweeping).
 
 ---
@@ -58,7 +59,7 @@ TracePort wraps any CLI or agent process in a pure-Go (`CGO_ENABLED=0`) flight r
 ```text
 +------------------------------------------------------------------------+
 |                           traceport CLI                                |
-|     record | sessions | inspect | diff | rewind | replay | verify      |
+|  record | sessions | tag | search | export | diff | rewind | verify    |
 +-------------------+--------------------------------+-------------------+
                     |                                |
                     v                                v
@@ -158,18 +159,51 @@ CGO_ENABLED=0 go build -trimpath -o traceport ./cmd/traceport
 
 ```bash
 traceport record -- claude code "Refactor authentication middleware"
-traceport record -- go test ./...
+traceport record --tag bug-42 --tag ci -- go test ./...
 ```
 
 Child exit codes and `SIGINT`/`SIGTERM` termination states are preserved and propagated to the caller.
 
-### List & Inspect Sessions
+### Tag, List & Inspect Sessions
 
 ```bash
+# List all sessions or filter by tag
 traceport sessions
-traceport list --json
+traceport list --tag bug-42
+traceport list --tag bug-42 --json
+
+# Add or remove tags on an existing session
+traceport tag <session_id> regression hotfix
+traceport tag <session_id> hotfix --remove --json
+
+# Inspect session metadata and frame timeline
 traceport inspect <session_id>
 traceport inspect <session_id> --json
+```
+
+### Cross-Session Search
+
+Scan recorded sessions across commands, tags, stdout/stderr frames, tool invocations, and shadow-tree checkpoint file mutations (`added`, `modified`, `deleted`):
+
+```bash
+# Case-insensitive substring search across all sessions (locates touched files or errors)
+traceport search middleware.go
+traceport search "syntax error" --tag bug-42
+
+# Regular expression search with structured JSON output
+traceport search "panic:|E_[A-Z_]+" --regex --json
+```
+
+### Portable Session Export & Secret Redaction
+
+Export a self-contained monolithic JSON `model.Session` (compatible out-of-the-box with `agentfixture import -traceport <file>` and CI artifacts) or a structured Markdown flight audit report, optionally scrubbing API keys (`sk-*`, `sk-ant-*`, `ghp_*`, `github_pat_*`, `AIza*`, `AKIA*`, `hf_*`, `xox*`), `Bearer` tokens, and URL basic-auth credentials:
+
+```bash
+# Export portable monolithic JSON (redacted) to file or stdout
+traceport export <session_id> --format json --redact --out fixture.json
+
+# Generate a Markdown flight audit report with metadata, checkpoint file deltas, and frame logs
+traceport export <session_id> --format markdown --redact --out audit_report.md
 ```
 
 ### Unified Checkpoint Diff

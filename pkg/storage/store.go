@@ -18,7 +18,10 @@ import (
 	"github.com/aloneangel45/traceport/pkg/model"
 )
 
-var validSessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+var (
+	validSessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	validTagRe       = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]{0,63}$`)
+)
 
 // ValidateSessionID strictly validates session IDs to prevent path traversal.
 func ValidateSessionID(id string) error {
@@ -28,10 +31,82 @@ func ValidateSessionID(id string) error {
 	return nil
 }
 
+// NormalizeTag trims, lowercases, and validates a single tag string.
+func NormalizeTag(raw string) (string, error) {
+	t := strings.ToLower(strings.TrimSpace(raw))
+	if t == "" {
+		return "", fmt.Errorf("invalid empty tag")
+	}
+	if len(t) > 64 || strings.Contains(t, "..") || !validTagRe.MatchString(t) {
+		return "", fmt.Errorf("invalid tag %q: must match ^[a-z0-9][a-z0-9._:/-]{0,63}$ without '..'", raw)
+	}
+	return t, nil
+}
+
+// ValidateTag verifies that raw is a safe, non-empty tag value.
+func ValidateTag(raw string) error {
+	_, err := NormalizeTag(raw)
+	return err
+}
+
+// NormalizeTags splits comma-separated tag inputs, trims, lowercases, validates, and deduplicates them.
+func NormalizeTags(inputs []string) ([]string, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(inputs))
+	out := make([]string, 0, len(inputs))
+	for _, raw := range inputs {
+		if strings.TrimSpace(raw) == "" {
+			return nil, fmt.Errorf("invalid empty tag")
+		}
+		parts := strings.Split(raw, ",")
+		for _, part := range parts {
+			norm, err := NormalizeTag(part)
+			if err != nil {
+				return nil, err
+			}
+			if _, exists := seen[norm]; !exists {
+				seen[norm] = struct{}{}
+				out = append(out, norm)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// HasTag reports whether sess carries targetTag (after normalization).
+func HasTag(sess model.Session, targetTag string) bool {
+	want, err := NormalizeTag(targetTag)
+	if err != nil {
+		return false
+	}
+	for _, existing := range sess.Tags {
+		if norm, nErr := NormalizeTag(existing); nErr == nil && norm == want {
+			return true
+		}
+	}
+	return false
+}
+
+// MatchesAllTags reports whether sess carries every tag in filterTags.
+func MatchesAllTags(sess model.Session, filterTags []string) bool {
+	for _, t := range filterTags {
+		if !HasTag(sess, t) {
+			return false
+		}
+	}
+	return true
+}
+
 type sessionMeta struct {
 	ID             string    `json:"id"`
 	Command        string    `json:"command"`
 	WorkspaceDir   string    `json:"workspace_dir,omitempty"`
+	Tags           []string  `json:"tags,omitempty"`
 	ExitCode       int       `json:"exit_code,omitempty"`
 	SafetySnapshot string    `json:"safety_snapshot,omitempty"`
 	StartTime      time.Time `json:"start_time"`
@@ -149,6 +224,11 @@ func (s *Store) SaveSession(sess *model.Session) error {
 	if err := ValidateSessionID(sess.ID); err != nil {
 		return err
 	}
+	normTags, err := NormalizeTags(sess.Tags)
+	if err != nil {
+		return err
+	}
+	sess.Tags = normTags
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,6 +274,11 @@ func (s *Store) UpdateSessionMeta(sess *model.Session) error {
 	if err := ValidateSessionID(sess.ID); err != nil {
 		return err
 	}
+	normTags, err := NormalizeTags(sess.Tags)
+	if err != nil {
+		return err
+	}
+	sess.Tags = normTags
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -202,6 +287,7 @@ func (s *Store) UpdateSessionMeta(sess *model.Session) error {
 		if legacy, lErr := s.loadLegacySessionLocked(sess.ID); lErr == nil {
 			legacy.Command = sess.Command
 			legacy.WorkspaceDir = sess.WorkspaceDir
+			legacy.Tags = sess.Tags
 			legacy.ExitCode = sess.ExitCode
 			legacy.SafetySnapshot = sess.SafetySnapshot
 			legacy.EndTime = sess.EndTime
@@ -220,11 +306,101 @@ func (s *Store) UpdateSessionMeta(sess *model.Session) error {
 	return s.writeMetaLocked(sess)
 }
 
+// AddSessionTags appends normalized, deduplicated tags to an existing session.
+func (s *Store) AddSessionTags(sessionID string, tags []string) (*model.Session, error) {
+	if err := ValidateSessionID(sessionID); err != nil {
+		return nil, err
+	}
+	addTags, err := NormalizeTags(tags)
+	if err != nil {
+		return nil, err
+	}
+	if len(addTags) == 0 {
+		return nil, fmt.Errorf("at least one tag is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, err := s.loadSessionLocked(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	merged, err := NormalizeTags(append(append([]string{}, sess.Tags...), addTags...))
+	if err != nil {
+		return nil, err
+	}
+	sess.Tags = merged
+
+	if _, err := os.Stat(s.metaFilePath(sessionID)); os.IsNotExist(err) {
+		if err := s.saveFullSessionLocked(sess); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := s.writeMetaLocked(sess); err != nil {
+			return nil, err
+		}
+	}
+	return sess, nil
+}
+
+// RemoveSessionTags removes the specified tags from an existing session.
+func (s *Store) RemoveSessionTags(sessionID string, tags []string) (*model.Session, error) {
+	if err := ValidateSessionID(sessionID); err != nil {
+		return nil, err
+	}
+	rmTags, err := NormalizeTags(tags)
+	if err != nil {
+		return nil, err
+	}
+	if len(rmTags) == 0 {
+		return nil, fmt.Errorf("at least one tag is required")
+	}
+
+	removeSet := make(map[string]struct{}, len(rmTags))
+	for _, t := range rmTags {
+		removeSet[t] = struct{}{}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, err := s.loadSessionLocked(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	var remaining []string
+	for _, existing := range sess.Tags {
+		norm, nErr := NormalizeTag(existing)
+		if nErr != nil {
+			norm = existing
+		}
+		if _, drop := removeSet[norm]; !drop {
+			remaining = append(remaining, norm)
+		}
+	}
+	sess.Tags = remaining
+
+	if _, err := os.Stat(s.metaFilePath(sessionID)); os.IsNotExist(err) {
+		if err := s.saveFullSessionLocked(sess); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := s.writeMetaLocked(sess); err != nil {
+			return nil, err
+		}
+	}
+	return sess, nil
+}
+
 func (s *Store) writeMetaLocked(sess *model.Session) error {
 	meta := sessionMeta{
 		ID:             sess.ID,
 		Command:        sess.Command,
 		WorkspaceDir:   sess.WorkspaceDir,
+		Tags:           sess.Tags,
 		ExitCode:       sess.ExitCode,
 		SafetySnapshot: sess.SafetySnapshot,
 		StartTime:      sess.StartTime,
@@ -325,11 +501,13 @@ func (s *Store) loadSessionLocked(sessionID string) (*model.Session, error) {
 		if frames == nil {
 			frames = []model.Frame{}
 		}
+		normTags, _ := NormalizeTags(meta.Tags)
 		s.frameCounts[sessionID] = len(frames)
 		return &model.Session{
 			ID:             meta.ID,
 			Command:        meta.Command,
 			WorkspaceDir:   meta.WorkspaceDir,
+			Tags:           normTags,
 			ExitCode:       meta.ExitCode,
 			SafetySnapshot: meta.SafetySnapshot,
 			StartTime:      meta.StartTime,
@@ -353,6 +531,9 @@ func (s *Store) loadLegacySessionLocked(sessionID string) (*model.Session, error
 	var sess model.Session
 	if err := json.Unmarshal(data, &sess); err != nil {
 		return nil, fmt.Errorf("corrupt session %s: %w", sessionID, err)
+	}
+	if normTags, nErr := NormalizeTags(sess.Tags); nErr == nil {
+		sess.Tags = normTags
 	}
 	if sess.Frames == nil {
 		sess.Frames = []model.Frame{}

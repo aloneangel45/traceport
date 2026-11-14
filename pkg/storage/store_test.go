@@ -281,3 +281,83 @@ func TestResolveStoreDir(t *testing.T) {
 		t.Fatalf("git root store discovery failed: got %q, want %q", gotGit, wantGit)
 	}
 }
+
+func TestStore_TagValidationNormalizationAndLifecycle(t *testing.T) {
+	norm, err := NormalizeTags([]string{"  Bug-42 ", "CI/Nightly,env:prod", "bug-42", "v1.2.0"})
+	if err != nil {
+		t.Fatalf("NormalizeTags failed: %v", err)
+	}
+	want := []string{"bug-42", "ci/nightly", "env:prod", "v1.2.0"}
+	if len(norm) != len(want) {
+		t.Fatalf("got %v, want %v", norm, want)
+	}
+	for i := range want {
+		if norm[i] != want[i] {
+			t.Fatalf("tag[%d] = %q, want %q", i, norm[i], want[i])
+		}
+	}
+
+	invalidTags := []string{
+		"",
+		"   ",
+		"-leading-dash",
+		"../escape",
+		"foo..bar",
+		"has space",
+		"bad$char",
+		"trailing,",
+		strings.Repeat("a", 65),
+	}
+	for _, bad := range invalidTags {
+		if _, err := NormalizeTags([]string{bad}); err == nil {
+			t.Errorf("expected NormalizeTags(%q) to fail", bad)
+		}
+	}
+
+	tmpDir := t.TempDir()
+	store, err := NewStoreWithPath(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess := &model.Session{
+		ID:        "trace_tagged_1",
+		Command:   "go test ./...",
+		Tags:      []string{"Bug-42", "Regression"},
+		StartTime: time.Now(),
+		Status:    "completed",
+		Frames: []model.Frame{
+			{Index: 1, Timestamp: time.Now(), Type: model.EventOutput, Content: "PASS"},
+		},
+	}
+	if err := store.SaveSession(sess); err != nil {
+		t.Fatalf("SaveSession with tags: %v", err)
+	}
+
+	updated, err := store.AddSessionTags(sess.ID, []string{"ci,regression", "release-v1.2"})
+	if err != nil {
+		t.Fatalf("AddSessionTags failed: %v", err)
+	}
+	if !HasTag(*updated, "BUG-42") || !HasTag(*updated, "ci") || !HasTag(*updated, "release-v1.2") {
+		t.Fatalf("unexpected tags after AddSessionTags: %v", updated.Tags)
+	}
+	if !MatchesAllTags(*updated, []string{"bug-42", "ci"}) {
+		t.Fatalf("expected MatchesAllTags to match")
+	}
+
+	afterRm, err := store.RemoveSessionTags(sess.ID, []string{"REGRESSION"})
+	if err != nil {
+		t.Fatalf("RemoveSessionTags failed: %v", err)
+	}
+	if HasTag(*afterRm, "regression") || len(afterRm.Tags) != 3 {
+		t.Fatalf("unexpected tags after RemoveSessionTags: %v", afterRm.Tags)
+	}
+
+	reloaded, err := store.GetSession(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Tags) != 3 || !HasTag(*reloaded, "release-v1.2") {
+		t.Fatalf("persisted tags mismatch: %v", reloaded.Tags)
+	}
+}

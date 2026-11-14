@@ -36,6 +36,11 @@ func TestCLIHelperProcess(t *testing.T) {
 	case "fail7":
 		fmt.Fprintln(os.Stderr, "fatal error 7")
 		os.Exit(7)
+	case "secret_run":
+		_ = os.WriteFile("audit_target.go", []byte("package demo\nconst Patched = true\n"), 0644)
+		fmt.Println("using token " + "sk-proj-" + "SecretTestKey1234567890 and " + "ghp_" + "SecretGitHubToken123456")
+		fmt.Fprintln(os.Stderr, "E_CONNECTION_REFUSED on https://admin:"+"superSecretPw99"+"@db.internal:5432/prod")
+		os.Exit(0)
 	}
 	os.Exit(0)
 }
@@ -220,5 +225,134 @@ func TestCLI_EndToEndCommandsAndJSONFlags(t *testing.T) {
 	var gcRep replay.GCReport
 	if err := json.Unmarshal(out.Bytes(), &gcRep); err != nil || gcRep.SessionsPruned != 1 {
 		t.Fatalf("expected 1 pruned session in GC report, got %+v (err=%v)", gcRep, err)
+	}
+}
+
+func TestCLI_TagsExportRedactAndSearch(t *testing.T) {
+	t.Setenv("TRACEPORT_CLI_HELPER", "1")
+	tpHome := t.TempDir()
+	t.Setenv("TRACEPORT_HOME", tpHome)
+
+	workDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(workDir, "base.go"), []byte("package demo\n"), 0644)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origWD) }()
+
+	var out, errBuf bytes.Buffer
+
+	// 1. record --tag bug-42 --tag sec,audit
+	code := run([]string{
+		"record", "--tag", "bug-42", "--tag", "sec,audit", "--",
+		os.Args[0], "-test.run=TestCLIHelperProcess", "--", "secret_run",
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("record --tag failed (code=%d): %s", code, errBuf.String())
+	}
+
+	// 2. record second untagged session
+	out.Reset()
+	errBuf.Reset()
+	code = run([]string{
+		"record", "--",
+		os.Args[0], "-test.run=TestCLIHelperProcess", "--", "ok",
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("record second session failed: %s", errBuf.String())
+	}
+
+	// 3. list --tag bug-42 --json
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"list", "--tag", "bug-42", "--json"}, &out, &errBuf); code != 0 {
+		t.Fatalf("list --tag failed: %s", errBuf.String())
+	}
+	var filtered []model.Session
+	if err := json.Unmarshal(out.Bytes(), &filtered); err != nil || len(filtered) != 1 {
+		t.Fatalf("expected 1 filtered session, got %d (err=%v)", len(filtered), err)
+	}
+	taggedID := filtered[0].ID
+
+	// 4. tag add & remove
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"tag", taggedID, "prod-hotfix", "--json"}, &out, &errBuf); code != 0 {
+		t.Fatalf("tag add failed: %s", errBuf.String())
+	}
+	var afterAdd model.Session
+	if err := json.Unmarshal(out.Bytes(), &afterAdd); err != nil || len(afterAdd.Tags) != 4 {
+		t.Fatalf("expected 4 tags after add, got %+v (err=%v)", afterAdd.Tags, err)
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"tag", taggedID, "audit", "--remove", "--json"}, &out, &errBuf); code != 0 {
+		t.Fatalf("tag --remove failed: %s", errBuf.String())
+	}
+	var afterRm model.Session
+	if err := json.Unmarshal(out.Bytes(), &afterRm); err != nil || len(afterRm.Tags) != 3 {
+		t.Fatalf("expected 3 tags after remove, got %+v (err=%v)", afterRm.Tags, err)
+	}
+
+	// 5. export --format json --redact (stdout + --out file)
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"export", taggedID, "--format", "json", "--redact"}, &out, &errBuf); code != 0 {
+		t.Fatalf("export json --redact failed: %s", errBuf.String())
+	}
+	rawJSONExport := out.String()
+	for _, secret := range []string{"sk-proj-" + "SecretTestKey1234567890", "ghp_" + "SecretGitHubToken123456", "superSecret" + "Pw99"} {
+		if strings.Contains(rawJSONExport, secret) {
+			t.Fatalf("secret %q leaked in exported JSON:\n%s", secret, rawJSONExport)
+		}
+	}
+	var portable model.Session
+	if err := json.Unmarshal(out.Bytes(), &portable); err != nil || portable.ID != taggedID || len(portable.Frames) == 0 {
+		t.Fatalf("exported portable JSON invalid: err=%v id=%q frames=%d", err, portable.ID, len(portable.Frames))
+	}
+
+	exportFile := filepath.Join(t.TempDir(), "audit", "report.md")
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"export", taggedID, "--format", "markdown", "--redact", "--out", exportFile}, &out, &errBuf); code != 0 {
+		t.Fatalf("export markdown --out failed: %s", errBuf.String())
+	}
+	mdBytes, err := os.ReadFile(exportFile)
+	if err != nil {
+		t.Fatalf("read exported markdown file: %v", err)
+	}
+	mdText := string(mdBytes)
+	if !strings.Contains(mdText, "## Session Metadata") || !strings.Contains(mdText, "audit_target.go") || !strings.Contains(mdText, "[REDACTED]") {
+		t.Fatalf("unexpected markdown audit report content:\n%s", mdText)
+	}
+	if strings.Contains(mdText, "superSecretPw99") {
+		t.Fatalf("secret leaked in markdown export")
+	}
+
+	// 6. search across checkpoint manifest path & regex error code
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"search", "audit_target.go", "--json"}, &out, &errBuf); code != 0 {
+		t.Fatalf("search file path failed: %s", errBuf.String())
+	}
+	var pathHits []replay.SessionSearchResult
+	if err := json.Unmarshal(out.Bytes(), &pathHits); err != nil || len(pathHits) != 1 || pathHits[0].SessionID != taggedID {
+		t.Fatalf("expected checkpoint_file search hit on %s, got %+v (err=%v)", taggedID, pathHits, err)
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"search", `E_CONNECTION_[A-Z]+`, "--regex", "--tag", "bug-42", "--json"}, &out, &errBuf); code != 0 {
+		t.Fatalf("search --regex --tag failed: %s", errBuf.String())
+	}
+	var regexHits []replay.SessionSearchResult
+	if err := json.Unmarshal(out.Bytes(), &regexHits); err != nil || len(regexHits) != 1 {
+		t.Fatalf("expected 1 regex search result, got %+v (err=%v)", regexHits, err)
 	}
 }

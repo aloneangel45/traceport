@@ -5,6 +5,23 @@ All notable changes to **TracePort** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-14
+
+### Added
+- **Session Tagging & Filtering (`record --tag`, `tag`, `list --tag`):**
+  - Added normalized, validated, deduplicated `Tags []string` (`json:"tags,omitempty"`) metadata to `model.Session` and atomic `<id>.meta.json` storage.
+  - Added `--tag <tag>` (repeatable or comma-separated) to `traceport record` so flight sessions can be tagged at recording time.
+  - Added `traceport tag <session_id> <tag...> [--remove] [--json]` subcommand to add or remove tags on existing sessions in `O(1)` metadata updates.
+  - Added `--tag <tag>` filter flag to `traceport list` / `sessions` across both human-readable tables and `--json` output.
+- **Portable Session Export, Secret Redaction & Markdown Audit Reports (`traceport export` & `pkg/redact`):**
+  - Added pure-Go zero-dependency credential scrubber (`pkg/redact`) covering OpenAI (`sk-*`, `sk-proj-*`), Anthropic (`sk-ant-*`), GitHub (`ghp_*`, `gho_*`, `ghs_*`, `github_pat_*`), Google (`AIza*`), AWS (`AKIA*`, `ASIA*`), HuggingFace (`hf_*`), Slack (`xox[baprs]-*`), `Bearer <token>` headers, and URL basic-auth credentials (`scheme://user:pass@host`).
+  - Added `traceport export <session_id> [--format json|markdown] [--out <path>] [--redact]`:
+    - `--format json` (default): Exports a self-contained monolithic `model.Session` JSON combining `.meta.json` and `.frames.jsonl` for CI artifacts and `agentfixture import -traceport <file>`.
+    - `--format markdown` (alias `md`): Generates structured Markdown flight audit reports with session metadata tables, shadow-tree checkpoint & file delta summaries, and chronological frame/tool logs.
+    - `--redact`: Deep-clones and scrubs sensitive credentials across commands, frame contents, and tool invocation arguments/results before writing to stdout or atomically to `--out <path>`.
+- **Cross-Session Search (`traceport search`):**
+  - Added `traceport search <query> [--regex] [--tag <tag>] [--json]` to scan recorded sessions across command strings, tags, frame contents, tool invocations, and shadow-tree checkpoint manifest file mutations (`added`, `modified`, `deleted`), supporting both case-insensitive substring matching and `--regex` regular expressions.
+
 ## [1.1.0] - 2026-11-10
 
 ### Added

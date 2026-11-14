@@ -44,6 +44,7 @@ type Runner struct {
 	store              *storage.Store
 	workspaceDir       string
 	checkpointInterval time.Duration
+	Tags               []string
 	Stdin              io.Reader
 	Stdout             io.Writer
 	Stderr             io.Writer
@@ -72,9 +73,24 @@ func (r *Runner) SetCheckpointInterval(d time.Duration) {
 	}
 }
 
+// SetTags validates, normalizes, and sets session tags to attach when recording starts.
+func (r *Runner) SetTags(tags []string) error {
+	norm, err := storage.NormalizeTags(tags)
+	if err != nil {
+		return err
+	}
+	r.Tags = norm
+	return nil
+}
+
 // Record spawns command with args inside workspaceDir, streaming stdout/stderr without line-size
 // limits while capturing initial, intermediate, and final Zstandard shadow-tree checkpoints.
 func (r *Runner) Record(command string, args []string) (*model.Session, error) {
+	normTags, err := storage.NormalizeTags(r.Tags)
+	if err != nil {
+		return nil, err
+	}
+
 	sessionID := nextUniqueSessionID()
 	fullCmd := command
 	if len(args) > 0 {
@@ -85,6 +101,7 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 		ID:           sessionID,
 		Command:      fullCmd,
 		WorkspaceDir: r.workspaceDir,
+		Tags:         normTags,
 		StartTime:    time.Now(),
 		Status:       "running",
 		Frames:       []model.Frame{},

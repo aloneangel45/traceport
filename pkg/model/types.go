@@ -37,6 +37,7 @@ type Session struct {
 	ID             string    `json:"id"`
 	Command        string    `json:"command"`
 	WorkspaceDir   string    `json:"workspace_dir,omitempty"`
+	Tags           []string  `json:"tags,omitempty"`
 	ExitCode       int       `json:"exit_code,omitempty"`
 	SafetySnapshot string    `json:"safety_snapshot,omitempty"`
 	StartTime      time.Time `json:"start_time"`

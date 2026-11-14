@@ -12,6 +12,7 @@ func TestSessionJSONRoundTripAndBackwardCompatibility(t *testing.T) {
 		ID:             "trace_100",
 		Command:        "go test ./...",
 		WorkspaceDir:   "/workspace/repo",
+		Tags:           []string{"bug-42", "ci"},
 		ExitCode:       0,
 		SafetySnapshot: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		StartTime:      now,
@@ -52,6 +53,9 @@ func TestSessionJSONRoundTripAndBackwardCompatibility(t *testing.T) {
 	}
 	if decoded.ID != orig.ID || decoded.WorkspaceDir != orig.WorkspaceDir || len(decoded.Frames) != 2 {
 		t.Fatalf("unexpected decoded session: %+v", decoded)
+	}
+	if len(decoded.Tags) != 2 || decoded.Tags[0] != "bug-42" || decoded.Tags[1] != "ci" {
+		t.Fatalf("unexpected decoded tags: %+v", decoded.Tags)
 	}
 	if decoded.Frames[1].Tool == nil || decoded.Frames[1].Tool.Name != "edit_file" {
 		t.Fatalf("tool invocation lost during JSON roundtrip")

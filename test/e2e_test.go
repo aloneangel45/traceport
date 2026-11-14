@@ -2,6 +2,7 @@ package test
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aloneangel45/traceport/pkg/model"
 	"github.com/aloneangel45/traceport/pkg/recorder"
 	"github.com/aloneangel45/traceport/pkg/replay"
 	"github.com/aloneangel45/traceport/pkg/storage"
@@ -22,6 +24,9 @@ func TestTracePort_LiveRecordAndReplay(t *testing.T) {
 	}
 
 	runner := recorder.NewRunner(store, tmpDir)
+	if err := runner.SetTags([]string{"e2e", "live-test"}); err != nil {
+		t.Fatalf("SetTags failed: %v", err)
+	}
 
 	cmdName := "cmd.exe"
 	cmdArgs := []string{"/c", "echo", "HELLO_TRACEPORT_TEST"}
@@ -40,6 +45,9 @@ func TestTracePort_LiveRecordAndReplay(t *testing.T) {
 	}
 	if len(session.Frames) == 0 {
 		t.Errorf("expected at least 1 recorded frame")
+	}
+	if !storage.HasTag(*session, "e2e") || !storage.HasTag(*session, "live-test") {
+		t.Errorf("expected recorded tags [e2e live-test], got %v", session.Tags)
 	}
 
 	eng := replay.NewEngine(store)
@@ -60,7 +68,7 @@ func TestTracePort_CompiledBinaryFullLifecycle(t *testing.T) {
 	}
 	binPath := filepath.Join(t.TempDir(), "traceport"+binExt)
 
-	buildCmd := exec.Command("go", "build", "-ldflags=-X main.Version=1.1.0-e2e", "-o", binPath, "../cmd/traceport")
+	buildCmd := exec.Command("go", "build", "-ldflags=-X main.Version=1.2.0-e2e", "-o", binPath, "../cmd/traceport")
 	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build traceport binary with CGO_ENABLED=0: %v\n%s", err, string(out))
@@ -81,7 +89,7 @@ func TestTracePort_CompiledBinaryFullLifecycle(t *testing.T) {
 
 	// 1. Verify ldflags version injection.
 	verOut, err := runTP("version")
-	if err != nil || strings.TrimSpace(verOut) != "traceport v1.1.0-e2e" {
+	if err != nil || strings.TrimSpace(verOut) != "traceport v1.2.0-e2e" {
 		t.Fatalf("unexpected version output: %q (err=%v)", verOut, err)
 	}
 
@@ -91,21 +99,115 @@ func TestTracePort_CompiledBinaryFullLifecycle(t *testing.T) {
 		t.Fatalf("dict train failed: %v\n%s", err, dictOut)
 	}
 
-	// 3. Record command that mutates workspace.
+	// 3. Record command with --tag that mutates workspace and emits a synthetic credential.
+	synthKey := "sk-proj-" + "TestSecretCredential987654"
 	var recArgs []string
 	if runtime.GOOS == "windows" {
-		recArgs = []string{"record", "--", "cmd.exe", "/c", "echo package service > generated.go && echo DONE_STEP"}
+		recArgs = []string{"record", "--tag", "bug-42,ci", "--", "cmd.exe", "/c", "echo package service > generated.go && echo KEY=" + synthKey + " && echo DONE_STEP"}
 	} else {
-		recArgs = []string{"record", "--", "sh", "-c", "printf 'package service\n' > generated.go && echo DONE_STEP"}
+		recArgs = []string{"record", "--tag", "bug-42,ci", "--", "sh", "-c", "printf 'package service\n' > generated.go && echo KEY=" + synthKey + " && echo DONE_STEP"}
 	}
 	recOut, err := runTP(recArgs...)
 	if err != nil {
-		t.Fatalf("binary record failed: %v\n%s", err, recOut)
+		t.Fatalf("binary record --tag failed: %v\n%s", err, recOut)
 	}
 
-	// 4. Verify integrity via CLI.
+	// 4. Record a second untagged session so list --tag filtering is verified.
+	var recArgs2 []string
+	if runtime.GOOS == "windows" {
+		recArgs2 = []string{"record", "--", "cmd.exe", "/c", "echo SECOND_UNFILTERED_RUN"}
+	} else {
+		recArgs2 = []string{"record", "--", "sh", "-c", "echo SECOND_UNFILTERED_RUN"}
+	}
+	if out2, err2 := runTP(recArgs2...); err2 != nil {
+		t.Fatalf("second record failed: %v\n%s", err2, out2)
+	}
+
+	// 5. Filter sessions with list --tag bug-42 --json and table output.
+	listTableOut, err := runTP("list", "--tag", "bug-42")
+	if err != nil || !strings.Contains(listTableOut, "bug-42") {
+		t.Fatalf("list --tag table failed: %v\n%s", err, listTableOut)
+	}
+
+	listJSONOut, err := runTP("list", "--tag", "bug-42", "--json")
+	if err != nil {
+		t.Fatalf("list --tag --json failed: %v\n%s", err, listJSONOut)
+	}
+	var taggedSessions []model.Session
+	if err := json.Unmarshal([]byte(listJSONOut), &taggedSessions); err != nil || len(taggedSessions) != 1 {
+		t.Fatalf("expected exactly 1 session matching bug-42, got %d (err=%v)\n%s", len(taggedSessions), err, listJSONOut)
+	}
+	sessionID := taggedSessions[0].ID
+
+	// 6. Add and remove tags via `traceport tag`.
+	tagAddOut, err := runTP("tag", sessionID, "release-blocker", "--json")
+	if err != nil {
+		t.Fatalf("tag add failed: %v\n%s", err, tagAddOut)
+	}
+	var afterTagAdd model.Session
+	if err := json.Unmarshal([]byte(tagAddOut), &afterTagAdd); err != nil || !storage.HasTag(afterTagAdd, "release-blocker") {
+		t.Fatalf("expected release-blocker tag on session: %+v (err=%v)", afterTagAdd.Tags, err)
+	}
+
+	tagRmOut, err := runTP("tag", sessionID, "ci", "--remove", "--json")
+	if err != nil {
+		t.Fatalf("tag --remove failed: %v\n%s", err, tagRmOut)
+	}
+	var afterTagRm model.Session
+	if err := json.Unmarshal([]byte(tagRmOut), &afterTagRm); err != nil || storage.HasTag(afterTagRm, "ci") {
+		t.Fatalf("expected ci tag removed: %+v (err=%v)", afterTagRm.Tags, err)
+	}
+
+	// 7. Portable JSON export with --redact (stdout + --out).
+	exportJSONPath := filepath.Join(t.TempDir(), "portable_session.json")
+	exportJSONCmdOut, err := runTP("export", sessionID, "--format", "json", "--redact", "--out", exportJSONPath)
+	if err != nil {
+		t.Fatalf("export --format json --redact --out failed: %v\n%s", err, exportJSONCmdOut)
+	}
+	exportedJSONBytes, err := os.ReadFile(exportJSONPath)
+	if err != nil {
+		t.Fatalf("failed reading exported JSON file: %v", err)
+	}
+	if strings.Contains(string(exportedJSONBytes), synthKey) {
+		t.Fatalf("secret credential leaked in exported JSON:\n%s", string(exportedJSONBytes))
+	}
+	var exportedSess model.Session
+	if err := json.Unmarshal(exportedJSONBytes, &exportedSess); err != nil || exportedSess.ID != sessionID || len(exportedSess.Frames) == 0 {
+		t.Fatalf("invalid portable exported session JSON: err=%v session=%+v", err, exportedSess)
+	}
+
+	// 8. Markdown flight audit report export (--format markdown --redact).
+	exportMDOut, err := runTP("export", sessionID, "--format", "markdown", "--redact")
+	if err != nil {
+		t.Fatalf("export --format markdown failed: %v\n%s", err, exportMDOut)
+	}
+	for _, mustHave := range []string{"# TracePort Flight Audit Report", "## Session Metadata", "generated.go", "[REDACTED]"} {
+		if !strings.Contains(exportMDOut, mustHave) {
+			t.Fatalf("markdown audit report missing %q:\n%s", mustHave, exportMDOut)
+		}
+	}
+	if strings.Contains(exportMDOut, synthKey) {
+		t.Fatalf("secret credential leaked in markdown audit report")
+	}
+
+	// 9. Cross-session search (checkpoint manifest file path + regex + tag filter + JSON).
+	searchFileOut, err := runTP("search", "generated.go", "--json")
+	if err != nil {
+		t.Fatalf("search generated.go failed: %v\n%s", err, searchFileOut)
+	}
+	var fileSearchResults []replay.SessionSearchResult
+	if err := json.Unmarshal([]byte(searchFileOut), &fileSearchResults); err != nil || len(fileSearchResults) != 1 || fileSearchResults[0].SessionID != sessionID {
+		t.Fatalf("unexpected search results for generated.go: %+v (err=%v)", fileSearchResults, err)
+	}
+
+	searchRegexOut, err := runTP("search", "DONE_[A-Z]+", "--regex", "--tag", "bug-42")
+	if err != nil || !strings.Contains(searchRegexOut, sessionID) {
+		t.Fatalf("search --regex --tag failed: %v\n%s", err, searchRegexOut)
+	}
+
+	// 10. Verify cryptographic integrity across all sessions.
 	verStoreOut, err := runTP("verify")
-	if err != nil || !strings.Contains(verStoreOut, "[ok] verified 1 sessions") {
+	if err != nil || !strings.Contains(verStoreOut, "[ok] verified 2 sessions") {
 		t.Fatalf("binary verify failed: %v\n%s", err, verStoreOut)
 	}
 }

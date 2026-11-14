@@ -8,28 +8,42 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/aloneangel45/traceport/pkg/checkpoint"
+	"github.com/aloneangel45/traceport/pkg/model"
 	"github.com/aloneangel45/traceport/pkg/recorder"
 	"github.com/aloneangel45/traceport/pkg/replay"
 	"github.com/aloneangel45/traceport/pkg/storage"
 )
 
 // Version is injected at link time via -ldflags "-X main.Version=...".
-var Version = "1.1.0"
+var Version = "1.2.0"
 
 func displayVersion() string {
 	v := strings.TrimSpace(Version)
 	if v == "" {
-		return "v1.1.0"
+		return "v1.2.0"
 	}
 	if strings.HasPrefix(v, "v") {
 		return v
 	}
 	return "v" + v
+}
+
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(val string) error {
+	*s = append(*s, val)
+	return nil
 }
 
 func main() {
@@ -66,8 +80,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return handleRecord(store, subArgs, stdout, stderr)
 	case "list", "ls", "sessions":
 		return handleList(store, subArgs, stdout, stderr)
+	case "tag":
+		return handleTag(store, subArgs, stdout, stderr)
 	case "inspect":
 		return handleInspect(store, subArgs, stdout, stderr)
+	case "export":
+		return handleExport(store, subArgs, stdout, stderr)
+	case "search":
+		return handleSearch(store, subArgs, stdout, stderr)
 	case "rewind":
 		return handleRewind(store, subArgs, stdout, stderr)
 	case "replay":
@@ -96,9 +116,12 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "Usage: traceport <command> [options]")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Core Commands:")
-	fmt.Fprintln(out, "  record -- <cmd> [args...]                 Record an agent or CLI execution session")
-	fmt.Fprintln(out, "  list | sessions [--json]                  List recorded flight sessions")
+	fmt.Fprintln(out, "  record [--tag <tag>] -- <cmd> [args...]   Record an agent or CLI execution session")
+	fmt.Fprintln(out, "  list | sessions [--tag <tag>] [--json]    List recorded flight sessions")
+	fmt.Fprintln(out, "  tag <session_id> <tag...> [--remove]      Add or remove tags on an existing session")
 	fmt.Fprintln(out, "  inspect <session_id> [--json]             Inspect session frames and metadata")
+	fmt.Fprintln(out, "  export <session_id> [--format json|md]    Export portable session JSON or audit report")
+	fmt.Fprintln(out, "  search <query> [--regex] [--tag <tag>]    Search across commands, frames, and checkpoints")
 	fmt.Fprintln(out, "  rewind <session_id> --step <N> [flags]    Roll back workspace and timeline to step N")
 	fmt.Fprintln(out, "  replay <session_id> [--from <N>]          Deterministic zero-token session playback")
 	fmt.Fprintln(out, "  diff <session_id> [--from A] [--to B]     Unified filesystem diff across checkpoints")
@@ -162,20 +185,68 @@ func truncateRunes(s string, maxRunes int) string {
 }
 
 func handleRecord(store *storage.Store, args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || (args[0] != "--" && (args[0] == "-h" || args[0] == "--help")) {
-		if len(args) > 0 {
-			fmt.Fprintln(stdout, "Usage: traceport record -- <cmd> [args...]")
-			return 0
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "[err] missing command to record (example: traceport record [--tag <tag>] -- go test ./...)")
+		return 1
+	}
+	if isHelpArg(args) {
+		fmt.Fprintln(stdout, "Usage: traceport record [--tag <tag>] -- <cmd> [args...]")
+		return 0
+	}
+
+	var flagTokens []string
+	var cmdTokens []string
+
+	dashIdx := -1
+	for i, a := range args {
+		if a == "--" {
+			dashIdx = i
+			break
 		}
-		fmt.Fprintln(stderr, "[err] missing command to record (example: traceport record -- go test ./...)")
+	}
+
+	if dashIdx >= 0 {
+		flagTokens = args[:dashIdx]
+		cmdTokens = args[dashIdx+1:]
+	} else {
+		fs := flag.NewFlagSet("record", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		var tagFlags stringSliceFlag
+		fs.Var(&tagFlags, "tag", "Attach session tag (repeatable or comma-separated)")
+		if err := fs.Parse(args); err != nil {
+			return 1
+		}
+		return executeRecordWithTags(store, tagFlags, fs.Args(), dashIdx >= 0, stdout, stderr)
+	}
+
+	fs := flag.NewFlagSet("record", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var tagFlags stringSliceFlag
+	fs.Var(&tagFlags, "tag", "Attach session tag (repeatable or comma-separated)")
+	if err := fs.Parse(flagTokens); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "[err] unexpected arguments before '--': %s\n", strings.Join(fs.Args(), " "))
 		return 1
 	}
 
-	if args[0] == "--" {
-		args = args[1:]
+	return executeRecordWithTags(store, tagFlags, cmdTokens, true, stdout, stderr)
+}
+
+func executeRecordWithTags(store *storage.Store, rawTags []string, cmdTokens []string, hadDash bool, stdout, stderr io.Writer) int {
+	if len(cmdTokens) == 0 {
+		if hadDash {
+			fmt.Fprintln(stderr, "[err] no target command specified after '--'")
+		} else {
+			fmt.Fprintln(stderr, "[err] missing command to record (example: traceport record -- go test ./...)")
+		}
+		return 1
 	}
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, "[err] no target command specified after '--'")
+
+	normTags, err := storage.NormalizeTags(rawTags)
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] %v\n", err)
 		return 1
 	}
 
@@ -186,11 +257,12 @@ func handleRecord(store *storage.Store, args []string, stdout, stderr io.Writer)
 	}
 
 	runner := recorder.NewRunner(store, cwd)
+	runner.Tags = normTags
 	runner.Stdout = stdout
 	runner.Stderr = stderr
 
-	fmt.Fprintf(stdout, "[traceport] recording command: %s\n", strings.Join(args, " "))
-	session, cmdErr := runner.Record(args[0], args[1:])
+	fmt.Fprintf(stdout, "[traceport] recording command: %s\n", strings.Join(cmdTokens, " "))
+	session, cmdErr := runner.Record(cmdTokens[0], cmdTokens[1:])
 	if cmdErr != nil {
 		exitCode := 1
 		if session != nil && session.ExitCode > 0 {
@@ -215,21 +287,36 @@ func handleRecord(store *storage.Store, args []string, stdout, stderr io.Writer)
 
 func handleList(store *storage.Store, args []string, stdout, stderr io.Writer) int {
 	if isHelpArg(args) {
-		fmt.Fprintln(stdout, "Usage: traceport list [--json] (aliases: ls, sessions)")
+		fmt.Fprintln(stdout, "Usage: traceport list [--tag <tag>] [--json] (aliases: ls, sessions)")
 		return 0
 	}
 
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "Emit JSON output")
-	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
+	var tagFlags stringSliceFlag
+	fs.Var(&tagFlags, "tag", "Filter sessions by tag")
+	if err := fs.Parse(reorderFlagsFirst(args, map[string]bool{"tag": true})); err != nil {
 		return 1
 	}
 
-	sessions, err := store.ListSessions()
+	filterTags, err := storage.NormalizeTags(tagFlags)
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] %v\n", err)
+		return 1
+	}
+
+	allSessions, err := store.ListSessions()
 	if err != nil {
 		fmt.Fprintf(stderr, "[err] failed reading sessions: %v\n", err)
 		return 1
+	}
+
+	sessions := make([]model.Session, 0, len(allSessions))
+	for _, s := range allSessions {
+		if len(filterTags) == 0 || storage.MatchesAllTags(s, filterTags) {
+			sessions = append(sessions, s)
+		}
 	}
 
 	if *asJSON {
@@ -243,19 +330,80 @@ func handleList(store *storage.Store, args []string, stdout, stderr io.Writer) i
 	}
 
 	if len(sessions) == 0 {
+		if len(filterTags) > 0 {
+			fmt.Fprintf(stdout, "[traceport] no sessions matched tag filter: %s\n", strings.Join(filterTags, ", "))
+			return 0
+		}
 		fmt.Fprintln(stdout, "[traceport] no sessions recorded yet (run: traceport record -- <cmd>)")
 		return 0
 	}
 
-	fmt.Fprintf(stdout, "%-26s %-18s %-8s %-20s %s\n", "SESSION ID", "STATUS", "FRAMES", "STARTED", "COMMAND")
-	fmt.Fprintln(stdout, strings.Repeat("-", 88))
+	fmt.Fprintf(stdout, "%-26s %-16s %-7s %-20s %-18s %s\n", "SESSION ID", "STATUS", "FRAMES", "STARTED", "TAGS", "COMMAND")
+	fmt.Fprintln(stdout, strings.Repeat("-", 104))
 
 	for _, s := range sessions {
 		started := s.StartTime.Format("2006-01-02 15:04:05")
-		cmdDisplay := truncateRunes(s.Command, 30)
-		statusDisplay := truncateRunes(s.Status, 17)
-		fmt.Fprintf(stdout, "%-26s %-18s %-8d %-20s %s\n", s.ID, statusDisplay, len(s.Frames), started, cmdDisplay)
+		cmdDisplay := truncateRunes(s.Command, 28)
+		statusDisplay := truncateRunes(s.Status, 15)
+		tagsDisplay := "-"
+		if len(s.Tags) > 0 {
+			tagsDisplay = truncateRunes(strings.Join(s.Tags, ","), 17)
+		}
+		fmt.Fprintf(stdout, "%-26s %-16s %-7d %-20s %-18s %s\n", s.ID, statusDisplay, len(s.Frames), started, tagsDisplay, cmdDisplay)
 	}
+	return 0
+}
+
+func handleTag(store *storage.Store, args []string, stdout, stderr io.Writer) int {
+	if isHelpArg(args) {
+		fmt.Fprintln(stdout, "Usage: traceport tag <session_id> <tag...> [--remove] [--json]")
+		return 0
+	}
+
+	fs := flag.NewFlagSet("tag", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	remove := fs.Bool("remove", false, "Remove specified tags instead of adding")
+	asJSON := fs.Bool("json", false, "Emit JSON output")
+	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
+		return 1
+	}
+	if fs.NArg() < 2 {
+		fmt.Fprintln(stderr, "[err] usage: traceport tag <session_id> <tag...> [--remove] [--json]")
+		return 1
+	}
+
+	sessionID := fs.Arg(0)
+	rawTags := fs.Args()[1:]
+
+	var (
+		updated *model.Session
+		err     error
+	)
+	if *remove {
+		updated, err = store.RemoveSessionTags(sessionID, rawTags)
+	} else {
+		updated, err = store.AddSessionTags(sessionID, rawTags)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] %v\n", err)
+		return 1
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(updated); err != nil {
+			fmt.Fprintf(stderr, "[err] json encode failed: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	tagsLabel := "(none)"
+	if len(updated.Tags) > 0 {
+		tagsLabel = strings.Join(updated.Tags, ", ")
+	}
+	fmt.Fprintf(stdout, "[ok] session %s tags: %s\n", updated.ID, tagsLabel)
 	return 0
 }
 
@@ -303,6 +451,9 @@ func handleInspect(store *storage.Store, args []string, stdout, stderr io.Writer
 	if session.WorkspaceDir != "" {
 		fmt.Fprintf(stdout, "Workspace:  %s\n", session.WorkspaceDir)
 	}
+	if len(session.Tags) > 0 {
+		fmt.Fprintf(stdout, "Tags:       %s\n", strings.Join(session.Tags, ", "))
+	}
 	fmt.Fprintf(stdout, "Status:     %s (exit=%d)\n", session.Status, session.ExitCode)
 	fmt.Fprintf(stdout, "Duration:   %s\n", duration)
 	if session.SafetySnapshot != "" {
@@ -323,6 +474,171 @@ func handleInspect(store *storage.Store, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stdout, "#%-5d %-12s %s\n", f.Index, f.Type, preview)
 	}
 	return 0
+}
+
+func handleExport(store *storage.Store, args []string, stdout, stderr io.Writer) int {
+	if isHelpArg(args) {
+		fmt.Fprintln(stdout, "Usage: traceport export <session_id> [--format json|markdown] [--out <path>] [--redact]")
+		return 0
+	}
+
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	format := fs.String("format", "json", "Export format: json or markdown (md)")
+	outPath := fs.String("out", "", "Destination file path (defaults to stdout)")
+	redactFlag := fs.Bool("redact", false, "Scrub API keys, bearer tokens, and URL credentials")
+
+	ordered := reorderFlagsFirst(args, map[string]bool{"format": true, "out": true})
+	if err := fs.Parse(ordered); err != nil {
+		return 1
+	}
+	if fs.NArg() < 1 {
+		fmt.Fprintln(stderr, "[err] usage: traceport export <session_id> [--format json|markdown] [--out <path>] [--redact]")
+		return 1
+	}
+
+	sessionID := fs.Arg(0)
+	eng := replay.NewEngine(store)
+	payload, err := eng.ExportSession(sessionID, replay.ExportOptions{
+		Format: *format,
+		Redact: *redactFlag,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] export failed: %v\n", err)
+		return 1
+	}
+
+	if strings.TrimSpace(*outPath) == "" {
+		if _, err := stdout.Write(payload); err != nil {
+			fmt.Fprintf(stderr, "[err] write export output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	if err := writeAtomicCLIFile(*outPath, payload, 0644); err != nil {
+		fmt.Fprintf(stderr, "[err] failed writing export file %q: %v\n", *outPath, err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "[ok] exported session %s (%s) -> %s\n", sessionID, strings.ToLower(strings.TrimSpace(*format)), *outPath)
+	return 0
+}
+
+func handleSearch(store *storage.Store, args []string, stdout, stderr io.Writer) int {
+	if isHelpArg(args) {
+		fmt.Fprintln(stdout, "Usage: traceport search <query> [--regex] [--tag <tag>] [--json]")
+		return 0
+	}
+
+	fs := flag.NewFlagSet("search", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	useRegex := fs.Bool("regex", false, "Interpret query as a regular expression")
+	asJSON := fs.Bool("json", false, "Emit JSON search results")
+	var tagFlags stringSliceFlag
+	fs.Var(&tagFlags, "tag", "Restrict search to sessions matching tag")
+
+	ordered := reorderFlagsFirst(args, map[string]bool{"tag": true})
+	if err := fs.Parse(ordered); err != nil {
+		return 1
+	}
+	if fs.NArg() < 1 {
+		fmt.Fprintln(stderr, "[err] usage: traceport search <query> [--regex] [--tag <tag>] [--json]")
+		return 1
+	}
+
+	query := strings.Join(fs.Args(), " ")
+	eng := replay.NewEngine(store)
+	results, err := eng.Search(replay.SearchOptions{
+		Query: query,
+		Regex: *useRegex,
+		Tags:  tagFlags,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] search failed: %v\n", err)
+		return 1
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(results); err != nil {
+			fmt.Fprintf(stderr, "[err] json encode failed: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	if len(results) == 0 {
+		fmt.Fprintf(stdout, "[traceport] no matches found for %q\n", query)
+		return 0
+	}
+
+	totalHits := 0
+	for _, res := range results {
+		totalHits += len(res.Matches)
+		tagSuffix := ""
+		if len(res.Tags) > 0 {
+			tagSuffix = fmt.Sprintf(" [tags:%s]", strings.Join(res.Tags, ","))
+		}
+		fmt.Fprintf(stdout, "Session %s (%s)%s -- %s\n", res.SessionID, res.Status, tagSuffix, truncateRunes(res.Command, 60))
+		for _, m := range res.Matches {
+			if m.Step > 0 {
+				fmt.Fprintf(stdout, "  [step #%d | %s] %s\n", m.Step, m.Source, m.Snippet)
+			} else {
+				fmt.Fprintf(stdout, "  [%s] %s\n", m.Source, m.Snippet)
+			}
+		}
+	}
+	fmt.Fprintf(stdout, "[ok] found %d matches across %d sessions\n", totalHits, len(results))
+	return 0
+}
+
+func writeAtomicCLIFile(dest string, data []byte, perm os.FileMode) error {
+	absDest, err := filepath.Abs(dest)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(absDest)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".tp-export-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		if err := tmp.Chmod(perm); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpName, absDest); err != nil {
+		_ = os.Chmod(absDest, 0600)
+		if retryErr := os.Rename(tmpName, absDest); retryErr != nil {
+			return retryErr
+		}
+	}
+	if runtime.GOOS != "windows" {
+		_ = os.Chmod(absDest, perm)
+	}
+	cleanup = false
+	return nil
 }
 
 func handleRewind(store *storage.Store, args []string, stdout, stderr io.Writer) int {
