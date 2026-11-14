@@ -22,12 +22,12 @@ import (
 )
 
 // Version is injected at link time via -ldflags "-X main.Version=...".
-var Version = "1.2.0"
+var Version = "1.2.1"
 
 func displayVersion() string {
 	v := strings.TrimSpace(Version)
 	if v == "" {
-		return "v1.2.0"
+		return "v1.2.1"
 	}
 	if strings.HasPrefix(v, "v") {
 		return v
@@ -145,13 +145,16 @@ func isHelpArg(args []string) bool {
 }
 
 // reorderFlagsFirst moves flag tokens ahead of positional tokens so Go's flag.FlagSet
-// parses flags regardless of whether they appear before or after <session_id>.
+// parses flags regardless of whether they appear before or after <session_id>, while
+// preserving '--' when explicit end-of-flags or leading-dash positional tokens are present.
 func reorderFlagsFirst(args []string, valueFlags map[string]bool) []string {
 	var flagsPart []string
 	var posPart []string
+	sawDoubleDash := false
 	for i := 0; i < len(args); i++ {
 		tok := args[i]
 		if tok == "--" {
+			sawDoubleDash = true
 			posPart = append(posPart, args[i+1:]...)
 			break
 		}
@@ -165,6 +168,25 @@ func reorderFlagsFirst(args []string, valueFlags map[string]bool) []string {
 		} else {
 			posPart = append(posPart, tok)
 		}
+	}
+	if len(posPart) == 0 {
+		return flagsPart
+	}
+	needsSep := sawDoubleDash
+	if !needsSep {
+		for _, p := range posPart {
+			if strings.HasPrefix(p, "-") && p != "-" {
+				needsSep = true
+				break
+			}
+		}
+	}
+	if needsSep {
+		out := make([]string, 0, len(flagsPart)+1+len(posPart))
+		out = append(out, flagsPart...)
+		out = append(out, "--")
+		out = append(out, posPart...)
+		return out
 	}
 	return append(flagsPart, posPart...)
 }
@@ -263,7 +285,7 @@ func executeRecordWithTags(store *storage.Store, rawTags []string, cmdTokens []s
 
 	fmt.Fprintf(stdout, "[traceport] recording command: %s\n", strings.Join(cmdTokens, " "))
 	session, cmdErr := runner.Record(cmdTokens[0], cmdTokens[1:])
-	if cmdErr != nil {
+	if cmdErr != nil || (session != nil && session.Status == "aborted") {
 		exitCode := 1
 		if session != nil && session.ExitCode > 0 {
 			exitCode = session.ExitCode
@@ -274,7 +296,11 @@ func executeRecordWithTags(store *storage.Store, rawTags []string, cmdTokens []s
 			}
 		}
 		if session != nil {
-			fmt.Fprintf(stderr, "[err] session %s aborted (exit=%d, frames=%d): %v\n", session.ID, exitCode, len(session.Frames), cmdErr)
+			if cmdErr != nil {
+				fmt.Fprintf(stderr, "[err] session %s aborted (exit=%d, frames=%d): %v\n", session.ID, exitCode, len(session.Frames), cmdErr)
+			} else {
+				fmt.Fprintf(stderr, "[err] session %s aborted (exit=%d, frames=%d)\n", session.ID, exitCode, len(session.Frames))
+			}
 		} else {
 			fmt.Fprintf(stderr, "[err] command execution failed: %v\n", cmdErr)
 		}
@@ -297,6 +323,10 @@ func handleList(store *storage.Store, args []string, stdout, stderr io.Writer) i
 	var tagFlags stringSliceFlag
 	fs.Var(&tagFlags, "tag", "Filter sessions by tag")
 	if err := fs.Parse(reorderFlagsFirst(args, map[string]bool{"tag": true})); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "[err] unexpected argument %q (usage: traceport list [--tag <tag>] [--json])\n", fs.Arg(0))
 		return 1
 	}
 
@@ -419,7 +449,7 @@ func handleInspect(store *storage.Store, args []string, stdout, stderr io.Writer
 	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
 		return 1
 	}
-	if fs.NArg() < 1 {
+	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "[err] usage: traceport inspect <session_id> [--json]")
 		return 1
 	}
@@ -492,7 +522,7 @@ func handleExport(store *storage.Store, args []string, stdout, stderr io.Writer)
 	if err := fs.Parse(ordered); err != nil {
 		return 1
 	}
-	if fs.NArg() < 1 {
+	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "[err] usage: traceport export <session_id> [--format json|markdown] [--out <path>] [--redact]")
 		return 1
 	}
@@ -610,6 +640,7 @@ func writeAtomicCLIFile(dest string, data []byte, perm os.FileMode) error {
 	cleanup := true
 	defer func() {
 		if cleanup {
+			_ = os.Chmod(tmpName, 0600)
 			_ = os.Remove(tmpName)
 		}
 	}()
@@ -657,7 +688,7 @@ func handleRewind(store *storage.Store, args []string, stdout, stderr io.Writer)
 	if err := fs.Parse(ordered); err != nil {
 		return 1
 	}
-	if fs.NArg() < 1 || *step <= 0 {
+	if fs.NArg() != 1 || *step <= 0 {
 		fmt.Fprintln(stderr, "[err] usage: traceport rewind <session_id> --step <N> [--force] [--dry-run]")
 		return 1
 	}
@@ -731,7 +762,7 @@ func handleReplay(store *storage.Store, args []string, stdout, stderr io.Writer)
 	if err := fs.Parse(ordered); err != nil {
 		return 1
 	}
-	if fs.NArg() < 1 {
+	if fs.NArg() != 1 || *fromStep <= 0 {
 		fmt.Fprintln(stderr, "[err] usage: traceport replay <session_id> [--from <N>]")
 		return 1
 	}
@@ -760,7 +791,7 @@ func handleDiff(store *storage.Store, args []string, stdout, stderr io.Writer) i
 	if err := fs.Parse(ordered); err != nil {
 		return 1
 	}
-	if fs.NArg() < 1 {
+	if fs.NArg() != 1 || *fromStep <= 0 || *toStep < 0 {
 		fmt.Fprintln(stderr, "[err] usage: traceport diff <session_id> [--from <stepA>] [--to <stepB>] [--json]")
 		return 1
 	}
@@ -799,6 +830,10 @@ func handleVerify(store *storage.Store, args []string, stdout, stderr io.Writer)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "Emit JSON verification report")
 	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
+		return 1
+	}
+	if fs.NArg() > 1 {
+		fmt.Fprintln(stderr, "[err] usage: traceport verify [<session_id>] [--json]")
 		return 1
 	}
 
@@ -859,6 +894,10 @@ func handleGC(store *storage.Store, args []string, stdout, stderr io.Writer) int
 	if err := fs.Parse(ordered); err != nil {
 		return 1
 	}
+	if fs.NArg() > 0 {
+		fmt.Fprintln(stderr, "[err] usage: traceport gc [--keep <N>] [--dry-run] [--json]")
+		return 1
+	}
 
 	eng := replay.NewEngine(store)
 	report, err := eng.GC(replay.GCOptions{
@@ -905,16 +944,23 @@ func handleDict(store *storage.Store, args []string, stdout, stderr io.Writer) i
 		return 1
 	}
 
-	sub := strings.ToLower(args[0])
-	if sub != "train" {
-		fmt.Fprintf(stderr, "[err] unknown dict subcommand %q (expected: train)\n", args[0])
-		return 1
-	}
-
 	fs := flag.NewFlagSet("dict train", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "Emit JSON dictionary stats")
-	if err := fs.Parse(reorderFlagsFirst(args[1:], nil)); err != nil {
+	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
+		return 1
+	}
+	if fs.NArg() == 0 {
+		fmt.Fprintln(stderr, "[err] usage: traceport dict train [--json]")
+		return 1
+	}
+	sub := strings.ToLower(fs.Arg(0))
+	if sub != "train" {
+		fmt.Fprintf(stderr, "[err] unknown dict subcommand %q (expected: train)\n", fs.Arg(0))
+		return 1
+	}
+	if fs.NArg() > 1 {
+		fmt.Fprintln(stderr, "[err] usage: traceport dict train [--json]")
 		return 1
 	}
 

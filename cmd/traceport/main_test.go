@@ -41,6 +41,9 @@ func TestCLIHelperProcess(t *testing.T) {
 		fmt.Println("using token " + "sk-proj-" + "SecretTestKey1234567890 and " + "ghp_" + "SecretGitHubToken123456")
 		fmt.Fprintln(os.Stderr, "E_CONNECTION_REFUSED on https://admin:"+"superSecretPw99"+"@db.internal:5432/prod")
 		os.Exit(0)
+	case "dash_output":
+		fmt.Println("go build -ldflags=-s -v ./cmd/demo")
+		os.Exit(0)
 	}
 	os.Exit(0)
 }
@@ -356,3 +359,86 @@ func TestCLI_TagsExportRedactAndSearch(t *testing.T) {
 		t.Fatalf("expected 1 regex search result, got %+v (err=%v)", regexHits, err)
 	}
 }
+
+func TestCLI_FlagReorderingDoubleDashAndPositionalValidation(t *testing.T) {
+	if Version != "1.2.1" || displayVersion() != "v1.2.1" {
+		t.Fatalf("expected default Version=1.2.1 / v1.2.1, got Version=%q display=%q", Version, displayVersion())
+	}
+
+	t.Setenv("TRACEPORT_CLI_HELPER", "1")
+	tpHome := t.TempDir()
+	t.Setenv("TRACEPORT_HOME", tpHome)
+
+	workDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(workDir, "main.go"), []byte("package main\nfunc main() {}\n"), 0644)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origWD) }()
+
+	var out, errBuf bytes.Buffer
+
+	// 1. `dict --json train` (flags before subcommand) must work cleanly.
+	if code := run([]string{"dict", "--json", "train"}, &out, &errBuf); code != 0 {
+		t.Fatalf("dict --json train failed (code=%d): %s", code, errBuf.String())
+	}
+	var dictOut map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &dictOut); err != nil {
+		t.Fatalf("dict --json train produced invalid JSON: %v\n%s", err, out.String())
+	}
+
+	// 2. Record a session outputting leading-dash CLI flags (-ldflags, -v).
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{
+		"record", "--tag", "dash-test", "--",
+		os.Args[0], "-test.run=TestCLIHelperProcess", "--", "dash_output",
+	}, &out, &errBuf); code != 0 {
+		t.Fatalf("record dash_output failed: %s", errBuf.String())
+	}
+
+	// 3. `search --json -- -ldflags` and `search --tag dash-test --json -- -v` must preserve `--`
+	// so `-ldflags` and `-v` are treated as literal search queries instead of unknown flags!
+	for _, query := range []string{"-ldflags", "-v"} {
+		out.Reset()
+		errBuf.Reset()
+		if code := run([]string{"search", "--tag", "dash-test", "--json", "--", query}, &out, &errBuf); code != 0 {
+			t.Fatalf("search -- %s failed (code=%d): %s", query, code, errBuf.String())
+		}
+		var hits []replay.SessionSearchResult
+		if err := json.Unmarshal(out.Bytes(), &hits); err != nil || len(hits) != 1 {
+			t.Fatalf("expected 1 search hit for %q, got %+v (err=%v)", query, hits, err)
+		}
+	}
+	sessionID := func() string {
+		var hits []replay.SessionSearchResult
+		_ = json.Unmarshal(out.Bytes(), &hits)
+		return hits[0].SessionID
+	}()
+
+	// 4. Unexpected extra positional arguments must be rejected with non-zero exit code.
+	invalidInvocations := [][]string{
+		{"list", "unexpected-arg"},
+		{"inspect", sessionID, "extra"},
+		{"export", sessionID, "extra"},
+		{"rewind", sessionID, "extra"},
+		{"replay", sessionID, "extra"},
+		{"diff", sessionID, "extra"},
+		{"verify", sessionID, "extra"},
+		{"gc", "extra"},
+		{"dict", "train", "extra"},
+	}
+	for _, inv := range invalidInvocations {
+		out.Reset()
+		errBuf.Reset()
+		if code := run(inv, &out, &errBuf); code == 0 {
+			t.Fatalf("expected non-zero exit code for invalid positional args %v, got 0", inv)
+		}
+	}
+}
+

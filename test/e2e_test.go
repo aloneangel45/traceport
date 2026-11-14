@@ -1,8 +1,14 @@
 package test
 
 import (
+	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -211,3 +217,127 @@ func TestTracePort_CompiledBinaryFullLifecycle(t *testing.T) {
 		t.Fatalf("binary verify failed: %v\n%s", err, verStoreOut)
 	}
 }
+
+func TestInstallerPS1_RestrictedPSModulePathEndToEnd(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("install.ps1 integration test runs on Windows")
+	}
+
+	psExe, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("powershell.exe not found in PATH")
+	}
+
+	builtBin := filepath.Join(t.TempDir(), "traceport.exe")
+	buildCmd := exec.Command("go", "build", "-o", builtBin, "../cmd/traceport")
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed building traceport.exe: %v\n%s", err, string(out))
+	}
+	binBytes, err := os.ReadFile(builtBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	arch := "amd64"
+	if runtime.GOARCH == "arm64" {
+		arch = "arm64"
+	}
+	archiveName := "traceport-windows-" + arch + ".zip"
+
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	// Nest binary inside a subdirectory to verify recursive extraction lookup too.
+	fw, err := zw.Create("release-bundle/traceport-windows-" + arch + ".exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(binBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zipPayload := zipBuf.Bytes()
+	sum := sha256.Sum256(zipPayload)
+	validSHA := hex.EncodeToString(sum[:])
+
+	serveTampered := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + archiveName:
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write(zipPayload)
+		case "/checksums.txt":
+			digest := validSHA
+			if serveTampered {
+				digest = strings.Repeat("0", 64)
+			}
+			_, _ = fmt.Fprintf(w, "%s *%s\n", digest, archiveName)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	scriptPath, err := filepath.Abs("../install.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	installDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-populate a read-only old binary to ensure install.ps1 clears FILE_ATTRIBUTE_READONLY.
+	destExe := filepath.Join(installDir, "traceport.exe")
+	if err := os.WriteFile(destExe, []byte("stale-binary"), 0444); err != nil {
+		t.Fatal(err)
+	}
+
+	runInstaller := func() (string, error) {
+		psBootstrap := fmt.Sprintf(
+			"$PSModuleAutoLoadingPreference = 'None'; $env:PSModulePath = ''; & '%s'",
+			strings.ReplaceAll(scriptPath, "'", "''"),
+		)
+		cmd := exec.Command(psExe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psBootstrap)
+		var cleanEnv []string
+		for _, kv := range os.Environ() {
+			if strings.HasPrefix(strings.ToUpper(kv), "PSMODULEPATH=") {
+				continue
+			}
+			cleanEnv = append(cleanEnv, kv)
+		}
+		cleanEnv = append(cleanEnv,
+			"PSModulePath=",
+			"TRACEPORT_INSTALL_DIR="+installDir,
+			"TRACEPORT_RELEASE_BASE_URL="+srv.URL,
+			"TRACEPORT_SKIP_PATH_UPDATE=1",
+		)
+		cmd.Env = cleanEnv
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// 1. Valid SHA-256 + zero-module PowerShell must succeed and overwrite read-only binary.
+	out, err := runInstaller()
+	if err != nil {
+		t.Fatalf("install.ps1 failed under restricted PSModulePath: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "[ok] verified SHA-256 digest: "+validSHA) {
+		t.Fatalf("expected verified SHA-256 log in installer output:\n%s", out)
+	}
+
+	verOut, err := exec.Command(destExe, "version").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(verOut)) != "traceport v1.2.1" {
+		t.Fatalf("installed traceport.exe version check failed: err=%v out=%q", err, string(verOut))
+	}
+
+	// 2. Tampered checksums.txt must fail closed.
+	serveTampered = true
+	badOut, badErr := runInstaller()
+	if badErr == nil || !strings.Contains(badOut, "SHA-256 checksum mismatch") {
+		t.Fatalf("expected SHA-256 mismatch error from install.ps1, got err=%v\n%s", badErr, badOut)
+	}
+}
+

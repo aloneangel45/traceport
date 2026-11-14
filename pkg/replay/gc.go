@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,9 +33,27 @@ type GCReport struct {
 // GC prunes old sessions beyond opts.Keep (when Keep >= 0) and sweeps unreferenced
 // Zstandard manifests and content-addressed blobs from the TracePort store.
 func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
+	allIDs, err := e.store.ListSessionIDs()
+	if err != nil {
+		return nil, err
+	}
+
 	sessions, err := e.store.ListSessions()
 	if err != nil {
 		return nil, err
+	}
+
+	loadedIDs := make(map[string]bool, len(sessions))
+	for _, s := range sessions {
+		loadedIDs[s.ID] = true
+	}
+	// Never sweep manifests or blobs if any session on disk failed to decode; otherwise GC would
+	// treat that session's referenced trees and blobs as unreachable and permanently delete them.
+	for _, id := range allIDs {
+		if !loadedIDs[id] {
+			_, loadErr := e.store.GetSession(id)
+			return nil, fmt.Errorf("refusing garbage collection: session %s is unreadable (%v); run 'traceport verify' before gc", id, loadErr)
+		}
 	}
 
 	report := &GCReport{
@@ -92,9 +111,12 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 	// Collect reachable blob SHA-256 digests and logical uncompressed bytes.
 	reachableBlobs := make(map[string]int64)
 	for treeHash := range reachableTrees {
+		if !treeStore.HasTree(treeHash) {
+			continue
+		}
 		manifest, mErr := treeStore.LoadManifest(treeHash)
 		if mErr != nil {
-			continue
+			return nil, fmt.Errorf("refusing garbage collection: retained manifest %s failed to load: %w", treeHash, mErr)
 		}
 		for _, f := range manifest.Files {
 			reachableBlobs[f.SHA256] = f.Size
@@ -121,7 +143,7 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 				report.TreesRemoved++
 				report.BytesReclaimed += fSize
 				if !opts.DryRun {
-					_ = os.Remove(fullPath)
+					removeWritableFile(fullPath)
 				}
 			}
 		}
@@ -159,11 +181,12 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 					report.BytesReclaimed += fSize
 					removedInFan++
 					if !opts.DryRun {
-						_ = os.Remove(fullPath)
+						removeWritableFile(fullPath)
 					}
 				}
 			}
 			if !opts.DryRun && removedInFan == len(bEntries) {
+				_ = os.Chmod(fanDir, 0700)
 				_ = os.Remove(fanDir)
 			}
 		}
@@ -171,7 +194,7 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 
 	if !opts.DryRun && report.BlobsRemoved > 0 {
 		// Remove stat_cache.json so subsequent snapshots rebuild clean blob references.
-		_ = os.Remove(filepath.Join(treesDir, "stat_cache.json"))
+		removeWritableFile(filepath.Join(treesDir, "stat_cache.json"))
 	}
 
 	if report.RetainedLogicalBytes > 0 {
@@ -179,4 +202,11 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 	}
 
 	return report, nil
+}
+
+func removeWritableFile(path string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		_ = os.Chmod(path, 0600)
+		_ = os.Remove(path)
+	}
 }

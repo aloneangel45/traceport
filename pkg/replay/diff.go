@@ -53,14 +53,20 @@ func (e *Engine) DiffSession(sessionID string, fromStep, toStep int, workspaceDi
 		return nil, fmt.Errorf("session %s contains no frames", sessionID)
 	}
 
-	if fromStep <= 0 {
+	if fromStep < 0 {
+		return nil, fmt.Errorf("from step %d out of bounds (1..%d)", fromStep, len(session.Frames))
+	}
+	if toStep < 0 {
+		return nil, fmt.Errorf("to step %d out of bounds (0..%d)", toStep, len(session.Frames))
+	}
+	if fromStep == 0 {
 		fromStep = 1
 	}
 	if fromStep > len(session.Frames) {
 		return nil, fmt.Errorf("from step %d out of bounds (1..%d)", fromStep, len(session.Frames))
 	}
 	if toStep > len(session.Frames) {
-		return nil, fmt.Errorf("to step %d out of bounds (1..%d)", toStep, len(session.Frames))
+		return nil, fmt.Errorf("to step %d out of bounds (0..%d)", toStep, len(session.Frames))
 	}
 
 	workDir := workspaceDir
@@ -228,7 +234,10 @@ func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, 
 			}
 			return nil
 		}
-		if absStore != "" && !sameWorkStore && strings.HasPrefix(strings.ToLower(path), strings.ToLower(absStore)) {
+		if !d.IsDir() && (strings.HasPrefix(name, ".tp-tmp-") || strings.HasPrefix(name, ".tp-meta-") || strings.HasPrefix(name, ".tp-export-")) {
+			return nil
+		}
+		if absStore != "" && !sameWorkStore && isPathWithinDir(absStore, path) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -276,6 +285,17 @@ func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, 
 		return nil
 	})
 	return out, err
+}
+
+func isPathWithinDir(parentDir, candidate string) bool {
+	if sameWorkspacePath(parentDir, candidate) {
+		return true
+	}
+	rel, err := filepath.Rel(parentDir, candidate)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 func isBinaryPayload(b []byte) bool {

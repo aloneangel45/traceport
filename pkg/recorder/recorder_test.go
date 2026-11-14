@@ -191,3 +191,53 @@ func TestRunner_MultiStepCheckpointsAndExitCode(t *testing.T) {
 		t.Fatalf("expected >=3 distinct checkpoints (initial, intermediate, final), got count=%d distinct=%d", checkpointCount, len(distinctSnapshots))
 	}
 }
+
+func TestRunner_ZeroCheckpointIntervalAndStartFailureSession(t *testing.T) {
+	t.Setenv("TRACEPORT_TEST_HELPER", "1")
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(workDir, "main.go"), []byte("package main\n"), 0644)
+
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Struct literal / zero or negative interval must not panic in time.NewTicker.
+	runner := &Runner{
+		store:              store,
+		workspaceDir:       workDir,
+		checkpointInterval: 0,
+		Stdout:             io.Discard,
+		Stderr:             io.Discard,
+	}
+	runner.SetCheckpointInterval(-5 * time.Millisecond)
+
+	okSess, err := runner.Record(os.Args[0], []string{"-test.run=TestRecorderHelperProcess", "--", "pwd_and_args"})
+	if err != nil {
+		t.Fatalf("Record with zero/negative interval failed: %v", err)
+	}
+	if okSess == nil || okSess.Status != "completed" {
+		t.Fatalf("unexpected session after zero-interval run: %+v", okSess)
+	}
+
+	// 2. Spawn failure must still return the persisted aborted session (ExitCode=1) alongside error.
+	failedSess, startErr := runner.Record("definitely-nonexistent-traceport-binary-xyz-999", []string{"--check"})
+	if startErr == nil {
+		t.Fatalf("expected non-nil error when binary does not exist")
+	}
+	if failedSess == nil {
+		t.Fatalf("expected persisted aborted Session pointer on start failure, got nil")
+	}
+	if failedSess.Status != "aborted" || failedSess.ExitCode != 1 {
+		t.Fatalf("expected aborted session with ExitCode=1, got status=%q exit=%d", failedSess.Status, failedSess.ExitCode)
+	}
+	reloaded, loadErr := store.GetSession(failedSess.ID)
+	if loadErr != nil {
+		t.Fatalf("failed loading persisted failed-start session: %v", loadErr)
+	}
+	if reloaded.Status != "aborted" || reloaded.ExitCode != 1 {
+		t.Fatalf("reloaded session mismatch: status=%q exit=%d", reloaded.Status, reloaded.ExitCode)
+	}
+}
+

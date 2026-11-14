@@ -5,57 +5,108 @@
 
 $ErrorActionPreference = "Stop"
 
+# Ensure built-in PowerShell module path is present when invoked in stripped CI/container shells,
+# while still using pure .NET APIs throughout so zero external modules are required.
+if ($PSHome) {
+    $BuiltInModules = [System.IO.Path]::Combine($PSHome, "Modules")
+    if ([string]::IsNullOrWhiteSpace($env:PSModulePath)) {
+        $env:PSModulePath = $BuiltInModules
+    }
+}
+
 $Repo = "aloneangel45/traceport"
 $BinaryName = "traceport.exe"
-$InstallDir = Join-Path $env:USERPROFILE ".local\bin"
+$InstallDir = if ($env:TRACEPORT_INSTALL_DIR) {
+    $env:TRACEPORT_INSTALL_DIR
+} else {
+    [System.IO.Path]::Combine([System.IO.Path]::Combine($env:USERPROFILE, ".local"), "bin")
+}
 
-Write-Host "[traceport] initiating Windows installer"
+function Invoke-TracePortDownload([string]$Url, [string]$OutFile) {
+    $Client = [System.Net.WebClient]::new()
+    try {
+        $Client.Headers.Add("User-Agent", "traceport-installer")
+        $Client.DownloadFile($Url, $OutFile)
+    } finally {
+        $Client.Dispose()
+    }
+}
+
+function Invoke-TracePortDownloadString([string]$Url) {
+    $Client = [System.Net.WebClient]::new()
+    try {
+        $Client.Headers.Add("User-Agent", "traceport-installer")
+        return $Client.DownloadString($Url)
+    } finally {
+        $Client.Dispose()
+    }
+}
+
+[Console]::WriteLine("[traceport] initiating Windows installer")
 
 # 1. Detect Architecture
 $Arch = "amd64"
 if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
     $Arch = "arm64"
 }
-Write-Host "[traceport] detected platform: windows/$Arch"
+[Console]::WriteLine("[traceport] detected platform: windows/$Arch")
 
-# 2. Resolve Latest Release
-$Tag = "v1.1.0"
+# Enable TLS 1.2 (3072) while preserving any newer enabled protocols (e.g. TLS 1.3)
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $ReleaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -TimeoutSec 10
-    if ($ReleaseInfo.tag_name) {
-        $Tag = $ReleaseInfo.tag_name
-    }
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
 } catch {
-    Write-Host "[warn] GitHub API unavailable; falling back to release $Tag"
 }
 
-Write-Host "[traceport] target release: $Tag"
+# 2. Resolve Target Release & Base URL
+$Tag = if ($env:TRACEPORT_VERSION) { $env:TRACEPORT_VERSION } else { "" }
+$BaseUrl = if ($env:TRACEPORT_RELEASE_BASE_URL) { $env:TRACEPORT_RELEASE_BASE_URL.TrimEnd("/") } else { "" }
+
+if (-not $BaseUrl) {
+    if (-not $Tag) {
+        $Tag = "v1.2.1"
+        try {
+            $ReleaseJson = Invoke-TracePortDownloadString "https://api.github.com/repos/$Repo/releases/latest"
+            $Match = [System.Text.RegularExpressions.Regex]::Match($ReleaseJson, '"tag_name"\s*:\s*"([^"]+)"')
+            if ($Match.Success -and $Match.Groups[1].Value) {
+                $Tag = $Match.Groups[1].Value
+            }
+        } catch {
+            [Console]::WriteLine("[warn] GitHub API unavailable; falling back to release $Tag")
+        }
+    }
+    [Console]::WriteLine("[traceport] target release: $Tag")
+    $BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
+} else {
+    [Console]::WriteLine("[traceport] using custom release base URL: $BaseUrl")
+}
 
 # 3. Download Release Asset and checksums.txt
 $ArchiveName = "traceport-windows-$Arch.zip"
-$BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
 $DownloadUrl = "$BaseUrl/$ArchiveName"
 $ChecksumsUrl = "$BaseUrl/checksums.txt"
 
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
-New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+$TempDir = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid().ToString())
+$null = [System.IO.Directory]::CreateDirectory($TempDir)
 
 try {
-    $ZipPath = Join-Path $TempDir $ArchiveName
-    $ChecksumsPath = Join-Path $TempDir "checksums.txt"
+    $ZipPath = [System.IO.Path]::Combine($TempDir, $ArchiveName)
+    $ChecksumsPath = [System.IO.Path]::Combine($TempDir, "checksums.txt")
 
-    Write-Host "[traceport] downloading $DownloadUrl"
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
+    [Console]::WriteLine("[traceport] downloading $DownloadUrl")
+    Invoke-TracePortDownload $DownloadUrl $ZipPath
 
-    Write-Host "[traceport] downloading $ChecksumsUrl"
-    Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath -UseBasicParsing
+    [Console]::WriteLine("[traceport] downloading $ChecksumsUrl")
+    Invoke-TracePortDownload $ChecksumsUrl $ChecksumsPath
 
-    # 4. Verify SHA-256 Digest
+    # 4. Verify SHA-256 Digest (pure .NET for restricted PSModulePath compatibility)
     $ExpectedHash = $null
-    foreach ($Line in (Get-Content -Path $ChecksumsPath)) {
-        $Parts = ($Line -split "\s+") | Where-Object { $_ -ne "" }
-        if ($Parts.Count -ge 2) {
+    foreach ($Line in [System.IO.File]::ReadAllLines($ChecksumsPath)) {
+        $Trimmed = $Line.Trim()
+        if ($Trimmed.Length -eq 0) {
+            continue
+        }
+        $Parts = $Trimmed -split "\s+"
+        if ($Parts.Length -ge 2) {
             $FileField = $Parts[1].TrimStart("*")
             if ($FileField -eq $ArchiveName) {
                 $ExpectedHash = $Parts[0].ToLowerInvariant()
@@ -68,49 +119,107 @@ try {
         throw "Archive $ArchiveName not found in checksums.txt"
     }
 
-    $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $FileStream = [System.IO.File]::OpenRead($ZipPath)
+        try {
+            $HashBytes = $Sha256.ComputeHash($FileStream)
+        } finally {
+            $FileStream.Dispose()
+        }
+    } finally {
+        $Sha256.Dispose()
+    }
+    $ActualHash = [System.BitConverter]::ToString($HashBytes).Replace("-", "").ToLowerInvariant()
     if ($ActualHash -ne $ExpectedHash) {
         throw "SHA-256 checksum mismatch for ${ArchiveName}: expected $ExpectedHash, got $ActualHash"
     }
-    Write-Host "[ok] verified SHA-256 digest: $ActualHash"
+    [Console]::WriteLine("[ok] verified SHA-256 digest: $ActualHash")
 
-    # 5. Extract and Install
-    Write-Host "[traceport] extracting archive"
-    Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
+    # 5. Extract and Install (pure .NET ZipFile without Expand-Archive module dependency)
+    [Console]::WriteLine("[traceport] extracting archive")
+    if (-not ("System.IO.Compression.ZipFile" -as [type])) {
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+        } catch {
+            $null = [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem")
+        }
+    }
+    $ExtractDir = [System.IO.Path]::Combine($TempDir, "extracted")
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractDir)
 
-    $ExtractedBinary = Get-ChildItem -Path $TempDir -Filter "*.exe" -Recurse | Select-Object -First 1
-    if (-not $ExtractedBinary) {
+    $CandidateDirect = [System.IO.Path]::Combine($ExtractDir, $BinaryName)
+    $CandidateArch = [System.IO.Path]::Combine($ExtractDir, "traceport-windows-$Arch.exe")
+    $ExtractedBinaryPath = $null
+    if ([System.IO.File]::Exists($CandidateDirect)) {
+        $ExtractedBinaryPath = $CandidateDirect
+    } elseif ([System.IO.File]::Exists($CandidateArch)) {
+        $ExtractedBinaryPath = $CandidateArch
+    } else {
+        $FoundExes = [System.IO.Directory]::GetFiles($ExtractDir, "*.exe", [System.IO.SearchOption]::AllDirectories)
+        foreach ($Candidate in $FoundExes) {
+            $LeafName = [System.IO.Path]::GetFileName($Candidate)
+            if ([string]::Equals($LeafName, $BinaryName, [System.StringComparison]::OrdinalIgnoreCase) -or
+                [string]::Equals($LeafName, "traceport-windows-$Arch.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $ExtractedBinaryPath = $Candidate
+                break
+            }
+        }
+        if (-not $ExtractedBinaryPath -and $FoundExes.Length -gt 0) {
+            $ExtractedBinaryPath = $FoundExes[0]
+        }
+    }
+
+    if (-not $ExtractedBinaryPath) {
         throw "Extraction failed: executable not found in archive"
     }
 
-    if (-not (Test-Path $InstallDir)) {
-        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    }
+    $null = [System.IO.Directory]::CreateDirectory($InstallDir)
 
-    $DestinationFile = Join-Path $InstallDir $BinaryName
-    Copy-Item -Path $ExtractedBinary.FullName -Destination $DestinationFile -Force
+    $DestinationFile = [System.IO.Path]::Combine($InstallDir, $BinaryName)
+    if ([System.IO.File]::Exists($DestinationFile)) {
+        try {
+            [System.IO.File]::SetAttributes($DestinationFile, [System.IO.FileAttributes]::Normal)
+        } catch {
+        }
+    }
+    [System.IO.File]::Copy($ExtractedBinaryPath, $DestinationFile, $true)
 } finally {
-    Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+    try {
+        if ([System.IO.Directory]::Exists($TempDir)) {
+            [System.IO.Directory]::Delete($TempDir, $true)
+        }
+    } catch {
+        # Ignore best-effort temporary directory cleanup errors
+    }
 }
 
 # 6. Ensure PATH is updated in User Environment
-$UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if (-not $UserPath) {
-    $UserPath = ""
-}
-$PathEntries = $UserPath -split ";" | Where-Object { $_ -ne "" }
-if ($PathEntries -notcontains $InstallDir) {
-    Write-Host "[traceport] adding $InstallDir to user PATH"
-    $NewPath = if ($UserPath) { "$InstallDir;$UserPath" } else { $InstallDir }
-    [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
-    $env:PATH = "$InstallDir;$env:PATH"
+if ($env:TRACEPORT_SKIP_PATH_UPDATE -ne "1") {
+    $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+    if (-not $UserPath) {
+        $UserPath = ""
+    }
+    $AlreadyPresent = $false
+    foreach ($Entry in $UserPath.Split([char[]]@(';'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        if ([string]::Equals($Entry.TrimEnd('\'), $InstallDir.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            $AlreadyPresent = $true
+            break
+        }
+    }
+    if (-not $AlreadyPresent) {
+        [Console]::WriteLine("[traceport] adding $InstallDir to user PATH")
+        $NewPath = if ($UserPath) { "$InstallDir;$UserPath" } else { $InstallDir }
+        [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
+        $env:PATH = "$InstallDir;$env:PATH"
+    }
 }
 
-Write-Host "[ok] installed $DestinationFile"
-Write-Host ""
-Write-Host "Quick Start:"
-Write-Host "  traceport --help"
-Write-Host "  traceport record -- <cmd>"
-Write-Host "  traceport sessions"
-Write-Host "  traceport rewind <session_id> --step <N>"
-Write-Host ""
+[Console]::WriteLine("[ok] installed $DestinationFile")
+[Console]::WriteLine("")
+[Console]::WriteLine("Quick Start:")
+[Console]::WriteLine("  traceport --help")
+[Console]::WriteLine("  traceport record -- <cmd>")
+[Console]::WriteLine("  traceport sessions")
+[Console]::WriteLine("  traceport rewind <session_id> --step <N>")
+[Console]::WriteLine("")

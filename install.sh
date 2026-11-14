@@ -74,22 +74,31 @@ esac
 
 log_info "detected platform: ${OS}/${ARCH}"
 
-TAG=""
-if command -v curl >/dev/null 2>&1; then
-    TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
-elif command -v wget >/dev/null 2>&1; then
-    TAG=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
-fi
+TAG="${TRACEPORT_VERSION:-}"
+BASE_URL="${TRACEPORT_RELEASE_BASE_URL:-}"
+BASE_URL="${BASE_URL%/}"
 
-if [ -z "${TAG}" ]; then
-    TAG="v1.1.0"
-    log_warn "GitHub API unavailable; falling back to release ${TAG}"
-fi
+if [ -z "${BASE_URL}" ]; then
+    if [ -z "${TAG}" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+        elif command -v wget >/dev/null 2>&1; then
+            TAG=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+        fi
+    fi
 
-log_info "target release: ${TAG}"
+    if [ -z "${TAG}" ]; then
+        TAG="v1.2.1"
+        log_warn "GitHub API unavailable; falling back to release ${TAG}"
+    fi
+
+    log_info "target release: ${TAG}"
+    BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+else
+    log_info "using custom release base URL: ${BASE_URL}"
+fi
 
 ARCHIVE_NAME="traceport-${OS}-${ARCH}.tar.gz"
-BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
 DOWNLOAD_URL="${BASE_URL}/${ARCHIVE_NAME}"
 CHECKSUMS_URL="${BASE_URL}/checksums.txt"
 
@@ -119,28 +128,40 @@ fi
 log_ok "verified SHA-256 digest: ${ACTUAL_SHA}"
 
 log_info "extracting ${ARCHIVE_NAME}"
-tar -xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "${TMP_DIR}"
+EXTRACT_DIR="${TMP_DIR}/extracted"
+mkdir -p "${EXTRACT_DIR}"
+tar -xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "${EXTRACT_DIR}"
 
 EXTRACTED_BIN=""
-if [ -f "${TMP_DIR}/${BINARY_NAME}" ]; then
-    EXTRACTED_BIN="${TMP_DIR}/${BINARY_NAME}"
-elif [ -f "${TMP_DIR}/traceport-${OS}-${ARCH}" ]; then
-    EXTRACTED_BIN="${TMP_DIR}/traceport-${OS}-${ARCH}"
+if [ -f "${EXTRACT_DIR}/${BINARY_NAME}" ]; then
+    EXTRACTED_BIN="${EXTRACT_DIR}/${BINARY_NAME}"
+elif [ -f "${EXTRACT_DIR}/traceport-${OS}-${ARCH}" ]; then
+    EXTRACTED_BIN="${EXTRACT_DIR}/traceport-${OS}-${ARCH}"
 else
+    EXTRACTED_BIN="$(find "${EXTRACT_DIR}" -type f \( -name "${BINARY_NAME}" -o -name "traceport-${OS}-${ARCH}" \) | head -n 1 || true)"
+fi
+
+if [ -z "${EXTRACTED_BIN}" ] || [ ! -f "${EXTRACTED_BIN}" ]; then
     log_err "extraction failed: binary not found in archive"
     exit 1
 fi
 
 chmod 0755 "${EXTRACTED_BIN}"
 
-if [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ]; then
+if [ -n "${TRACEPORT_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="${TRACEPORT_INSTALL_DIR}"
+    mkdir -p "${INSTALL_DIR}"
+elif [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ]; then
     INSTALL_DIR="/usr/local/bin"
-    mv "${EXTRACTED_BIN}" "${INSTALL_DIR}/${BINARY_NAME}"
 else
     INSTALL_DIR="${HOME}/.local/bin"
     mkdir -p "${INSTALL_DIR}"
-    mv "${EXTRACTED_BIN}" "${INSTALL_DIR}/${BINARY_NAME}"
 fi
+
+STAGED_BIN="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
+cp "${EXTRACTED_BIN}" "${STAGED_BIN}"
+chmod 0755 "${STAGED_BIN}"
+mv -f "${STAGED_BIN}" "${INSTALL_DIR}/${BINARY_NAME}"
 
 log_ok "installed ${INSTALL_DIR}/${BINARY_NAME}"
 

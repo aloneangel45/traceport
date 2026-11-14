@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/traceport/pkg/checkpoint"
 	"github.com/aloneangel45/traceport/pkg/model"
@@ -291,5 +292,180 @@ func TestEngine_ExportAndSearch(t *testing.T) {
 	toolRes, err := eng.Search(SearchOptions{Query: "slack_post"})
 	if err != nil || len(toolRes) != 1 {
 		t.Fatalf("expected tool search match for slack_post, got %+v (err=%v)", toolRes, err)
+	}
+}
+
+func TestEngine_RefusesGCWhenSessionOrManifestCorrupt(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := filepath.Join(t.TempDir(), "sessions")
+
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, snap1, _ := buildMultiStepTestSession(t, store, workDir, "trace_gc_safe")
+	eng := NewEngine(store)
+
+	// Introduce a second session with corrupt .meta.json on disk.
+	corruptMeta := filepath.Join(store.BaseDir(), "trace_corrupt_99.meta.json")
+	if err := os.WriteFile(corruptMeta, []byte("{corrupt-json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.GC(GCOptions{Keep: -1}); err == nil {
+		t.Fatalf("expected GC to refuse sweeping when an unreadable session exists on disk")
+	}
+	_ = os.Remove(corruptMeta)
+
+	// Corrupt snap1 manifest and verify GC refuses to sweep snap1's blobs!
+	manifestFile := filepath.Join(store.RootDir(), "trees", snap1+".manifest.zst")
+	origManifest, err := os.ReadFile(manifestFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestFile, []byte("corrupt_manifest_bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.GC(GCOptions{Keep: -1}); err == nil {
+		t.Fatalf("expected GC to abort when a retained manifest fails to load")
+	}
+
+	// Restore clean manifest and verify session still verifies 100% (no blobs were lost!).
+	if err := os.WriteFile(manifestFile, origManifest, 0600); err != nil {
+		t.Fatal(err)
+	}
+	vRep, err := eng.Verify(sess.ID)
+	if err != nil || !vRep.Valid {
+		t.Fatalf("blobs lost during aborted GC! verify=%+v err=%v", vRep, err)
+	}
+}
+
+func TestEngine_LiveDiffStorePrefixCollisionAndStepBounds(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := filepath.Join(workDir, ".traceport", "sessions")
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Files starting with ".traceport" prefix (NOT inside .traceport/) MUST NOT be skipped by live diff!
+	prefixFile := filepath.Join(workDir, ".traceport-ci.yaml")
+	prefixNested := filepath.Join(workDir, ".traceport_docs", "guide.md")
+	_ = os.MkdirAll(filepath.Dir(prefixNested), 0755)
+	_ = os.WriteFile(prefixFile, []byte("ci: true\n"), 0644)
+	_ = os.WriteFile(prefixNested, []byte("# Guide\n"), 0644)
+
+	ts, err := checkpoint.NewTreeStore(workDir, store.RootDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ts.CreateSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ts.Close()
+
+	sess := &model.Session{
+		ID:           "trace_prefix_diff",
+		Command:      "go test",
+		WorkspaceDir: workDir,
+		StartTime:    time.Now(),
+		Status:       "completed",
+		Frames: []model.Frame{
+			{Index: 1, Timestamp: time.Now(), Type: model.EventCheckpoint, Content: "Initial", GitSnapshot: snap},
+		},
+	}
+	if err := store.SaveSession(sess); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := NewEngine(store)
+	diffRep, err := eng.DiffSession(sess.ID, 1, 0, workDir)
+	if err != nil {
+		t.Fatalf("DiffSession live failed: %v", err)
+	}
+	if len(diffRep.Changes) != 0 {
+		t.Fatalf("expected 0 live diff changes for unchanged .traceport-* files, got %+v", diffRep.Changes)
+	}
+
+	// Negative step indices and out-of-bounds Playback must return errors.
+	if _, err := eng.DiffSession(sess.ID, -1, 0, workDir); err == nil {
+		t.Fatalf("expected error for negative fromStep")
+	}
+	if _, err := eng.DiffSession(sess.ID, 1, -2, workDir); err == nil {
+		t.Fatalf("expected error for negative toStep")
+	}
+	var pb bytes.Buffer
+	if err := eng.Playback(sess.ID, 99, &pb); err == nil {
+		t.Fatalf("expected error for out-of-bounds Playback fromStep")
+	}
+
+	// DryRun rewind with missing snapshot must fail just like live rewind.
+	missingSess := &model.Session{
+		ID:           "trace_missing_snap",
+		Command:      "agent",
+		WorkspaceDir: workDir,
+		StartTime:    time.Now(),
+		Status:       "aborted",
+		Frames: []model.Frame{
+			{
+				Index:       1,
+				Timestamp:   time.Now(),
+				Type:        model.EventCheckpoint,
+				Content:     "Missing",
+				GitSnapshot: strings.Repeat("f", 64),
+			},
+		},
+	}
+	_ = store.SaveSession(missingSess)
+	if _, err := eng.RewindWithOptions(missingSess.ID, 1, workDir, RewindOptions{DryRun: true}); err == nil {
+		t.Fatalf("expected DryRun rewind to fail when snapshot manifest does not exist")
+	}
+}
+
+func TestEngine_ExportMarkdownUTF8BoundaryAndTildeFenceEscape(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "sessions")
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build >2000-rune multi-byte UTF-8 content containing 5-tilde fence "~~~~~".
+	multiByteChunk := "Çağdaş日本語🚀"
+	longContent := "~~~~~\ninjected fence\n~~~~~\n" + strings.Repeat(multiByteChunk, 260)
+	longResult := strings.Repeat("şğüöçı漢字", 160)
+
+	sess := &model.Session{
+		ID:        "trace_utf8_md",
+		Command:   "echo utf8",
+		StartTime: time.Now(),
+		Status:    "completed",
+		Frames: []model.Frame{
+			{
+				Index:     1,
+				Timestamp: time.Now(),
+				Type:      model.EventToolCall,
+				Content:   longContent,
+				Tool: &model.ToolInvocation{
+					Name:   "utf8_tool",
+					Result: longResult,
+				},
+			},
+		},
+	}
+	if err := store.SaveSession(sess); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := NewEngine(store)
+	mdBytes, err := eng.ExportSession(sess.ID, ExportOptions{Format: "markdown"})
+	if err != nil {
+		t.Fatalf("ExportSession markdown failed: %v", err)
+	}
+	if !utf8.Valid(mdBytes) {
+		t.Fatalf("ExportSession markdown produced invalid UTF-8 bytes on multi-byte truncation boundary!")
+	}
+	if !strings.Contains(string(mdBytes), "~~~~~~text\n") {
+		t.Fatalf("expected 6-tilde outer fence to escape embedded 5-tilde sequence:\n%s", string(mdBytes)[:400])
 	}
 }

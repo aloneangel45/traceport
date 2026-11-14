@@ -117,6 +117,11 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 	}
 	defer treeStore.Close()
 
+	interval := r.checkpointInterval
+	if interval <= 0 {
+		interval = DefaultCheckpointInterval
+	}
+
 	var snapMu sync.Mutex
 	var lastSnapHash string
 	var lastCheckTime time.Time
@@ -125,7 +130,7 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 		snapMu.Lock()
 		defer snapMu.Unlock()
 
-		if !force && time.Since(lastCheckTime) < r.checkpointInterval {
+		if !force && time.Since(lastCheckTime) < interval {
 			return
 		}
 		lastCheckTime = time.Now()
@@ -164,7 +169,10 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 		session.Status = "aborted"
 		session.ExitCode = 1
 		_ = r.store.UpdateSessionMeta(session)
-		return nil, fmt.Errorf("failed to start command: %w", err)
+		if abortedSess, gErr := r.store.GetSession(sessionID); gErr == nil {
+			return abortedSess, fmt.Errorf("failed to start command: %w", err)
+		}
+		return session, fmt.Errorf("failed to start command: %w", err)
 	}
 
 	// Trap SIGINT / SIGTERM and forward cleanly to the child process.
@@ -202,7 +210,7 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 	watcherDone := make(chan struct{})
 	go func() {
 		defer close(watcherDone)
-		ticker := time.NewTicker(r.checkpointInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -264,7 +272,7 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 	if cmdErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(cmdErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
+			exitCode = resolveExitCode(exitErr, interrupted.Load())
 		} else {
 			exitCode = 1
 		}

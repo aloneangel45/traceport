@@ -361,3 +361,96 @@ func TestStore_TagValidationNormalizationAndLifecycle(t *testing.T) {
 		t.Fatalf("persisted tags mismatch: %v", reloaded.Tags)
 	}
 }
+
+func TestStore_CrashTruncatedJSONLFollowedByAppendFrame(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewStoreWithPath(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess := &model.Session{
+		ID:        "trace_crash_append",
+		Command:   "agent run",
+		StartTime: time.Now(),
+		Status:    "running",
+	}
+	if err := store.SaveSession(sess); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendFrame(sess.ID, model.Frame{
+		Timestamp: time.Now(),
+		Type:      model.EventOutput,
+		Content:   "step_1_intact",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate SIGKILL mid-line write (no trailing newline).
+	framesPath := filepath.Join(tmpDir, sess.ID+".frames.jsonl")
+	f, err := os.OpenFile(framesPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.WriteString(`{"index":2,"type":"output","content":"sigkill_partial`)
+	_ = f.Close()
+
+	// Subsequent AppendFrame MUST repair the partial tail before appending, rather than
+	// concatenating onto the partial line and corrupting the JSONL log!
+	reopened, err := NewStoreWithPath(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended, err := reopened.AppendFrameWithIndex(sess.ID, model.Frame{
+		Timestamp: time.Now(),
+		Type:      model.EventOutput,
+		Content:   "step_2_clean_after_recovery",
+	})
+	if err != nil {
+		t.Fatalf("AppendFrameWithIndex after crash failed: %v", err)
+	}
+	if appended.Index != 2 {
+		t.Fatalf("expected repaired next frame index 2, got %d", appended.Index)
+	}
+
+	loaded, err := reopened.GetSession(sess.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed after post-crash append: %v", err)
+	}
+	if len(loaded.Frames) != 2 || loaded.Frames[0].Content != "step_1_intact" || loaded.Frames[1].Content != "step_2_clean_after_recovery" {
+		t.Fatalf("unexpected frames after recovery + append: %+v", loaded.Frames)
+	}
+
+	// Also test valid JSON final line lacking trailing '\n' followed by AppendFrame.
+	sess2 := &model.Session{
+		ID:        "trace_no_nl_valid",
+		Command:   "agent import",
+		StartTime: time.Now(),
+		Status:    "running",
+	}
+	if err := reopened.SaveSession(sess2); err != nil {
+		t.Fatal(err)
+	}
+	noNLPath := filepath.Join(tmpDir, sess2.ID+".frames.jsonl")
+	if err := os.WriteFile(noNLPath, []byte(`{"index":1,"timestamp":"2026-11-14T12:00:00Z","type":"output","content":"line_without_nl"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.AppendFrame(sess2.ID, model.Frame{
+		Timestamp: time.Now(),
+		Type:      model.EventOutput,
+		Content:   "second_line",
+	}); err != nil {
+		t.Fatalf("AppendFrame after valid no-newline frame failed: %v", err)
+	}
+	loaded2, err := reopened.GetSession(sess2.ID)
+	if err != nil || len(loaded2.Frames) != 2 || loaded2.Frames[1].Index != 2 {
+		t.Fatalf("expected 2 intact frames, got %+v (err=%v)", loaded2, err)
+	}
+
+	// Verify DeleteSession succeeds even if session files are marked read-only (0444).
+	_ = os.Chmod(filepath.Join(tmpDir, sess2.ID+".meta.json"), 0444)
+	_ = os.Chmod(noNLPath, 0444)
+	if err := reopened.DeleteSession(sess2.ID); err != nil {
+		t.Fatalf("DeleteSession failed on read-only session files: %v", err)
+	}
+}

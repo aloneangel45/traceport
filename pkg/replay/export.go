@@ -3,10 +3,10 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/traceport/pkg/checkpoint"
 	"github.com/aloneangel45/traceport/pkg/model"
@@ -150,18 +150,15 @@ func (e *Engine) renderMarkdownAuditReport(session *model.Session, redacted bool
 		}
 		sb.WriteString(fmt.Sprintf("### Step #%d — `%s` (%s)%s\n\n", f.Index, f.Type, ts, headerExtra))
 
-		excerpt := f.Content
-		const maxExcerptChars = 2000
-		if len(excerpt) > maxExcerptChars {
-			excerpt = excerpt[:maxExcerptChars] + "\n... [truncated]"
-		}
+		excerpt := truncateUTF8RunesWithSuffix(f.Content, 2000, "\n... [truncated]")
 		if strings.TrimSpace(excerpt) != "" {
-			sb.WriteString("~~~~text\n")
+			fence := tildeFenceForContent(excerpt)
+			sb.WriteString(fence + "text\n")
 			sb.WriteString(excerpt)
 			if !strings.HasSuffix(excerpt, "\n") {
 				sb.WriteString("\n")
 			}
-			sb.WriteString("~~~~\n\n")
+			sb.WriteString(fence + "\n\n")
 		}
 
 		if f.Tool != nil {
@@ -176,10 +173,7 @@ func (e *Engine) renderMarkdownAuditReport(session *model.Session, redacted bool
 				}
 			}
 			if strings.TrimSpace(f.Tool.Result) != "" {
-				resExcerpt := f.Tool.Result
-				if len(resExcerpt) > 1000 {
-					resExcerpt = resExcerpt[:1000] + "... [truncated]"
-				}
+				resExcerpt := truncateUTF8RunesWithSuffix(f.Tool.Result, 1000, "... [truncated]")
 				sb.WriteString(fmt.Sprintf("- **Result:** `%s`\n", escapeMarkdownTableCell(resExcerpt)))
 			}
 			sb.WriteString("\n")
@@ -189,16 +183,8 @@ func (e *Engine) renderMarkdownAuditReport(session *model.Session, redacted bool
 	return sb.String()
 }
 
-func (e *Engine) appendManifestDeltaMarkdown(sb *strings.Builder, session *model.Session, checkpoints []checkpointFrameRef) {
-	workDir := session.WorkspaceDir
-	if workDir == "" {
-		workDir, _ = os.Getwd()
-	}
-	if workDir == "" {
-		workDir = e.store.RootDir()
-	}
-
-	treeStore, err := checkpoint.NewTreeStore(workDir, e.store.RootDir())
+func (e *Engine) appendManifestDeltaMarkdown(sb *strings.Builder, _ *model.Session, checkpoints []checkpointFrameRef) {
+	treeStore, err := checkpoint.NewTreeStore(e.store.RootDir(), e.store.RootDir())
 	if err != nil {
 		return
 	}
@@ -300,4 +286,32 @@ func escapeMarkdownTableCell(s string) string {
 	s = strings.ReplaceAll(s, "|", "\\|")
 	s = strings.ReplaceAll(s, "`", "'")
 	return s
+}
+
+func truncateUTF8RunesWithSuffix(s string, maxRunes int, suffix string) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes]) + suffix
+}
+
+func tildeFenceForContent(s string) string {
+	maxRun := 0
+	cur := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '~' {
+			cur++
+			if cur > maxRun {
+				maxRun = cur
+			}
+		} else {
+			cur = 0
+		}
+	}
+	fenceLen := 4
+	if maxRun >= fenceLen {
+		fenceLen = maxRun + 1
+	}
+	return strings.Repeat("~", fenceLen)
 }

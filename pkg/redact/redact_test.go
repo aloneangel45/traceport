@@ -202,3 +202,78 @@ func TestSession_DeepCopyAndScrubbing(t *testing.T) {
 		t.Fatalf("expected non-secret numeric argument max_tokens=512, got %v", scrubbed.Frames[1].Tool.Arguments["max_tokens"])
 	}
 }
+
+func TestRedact_PEMPrivateKeysQueryParamsHeadersAndNestedSlices(t *testing.T) {
+	pemKey := "-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+		"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n" +
+		"-----END OPENSSH PRIVATE KEY-----"
+	urlSecret := "myQuerySecretValue987654"
+	xApiVal := "customXApiKeySecret123456"
+	awsSecret := "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	stripeKey := "sk_live_" + "51AbCdEfGhIjKlMnOpQrStUv"
+	gitlabPat := "glpat-" + "abcdef1234567890XYZ"
+	npmTok := "npm_" + "1234567890abcdefABCDEF"
+
+	rawText := strings.Join([]string{
+		"PEM:\n" + pemKey,
+		"URL: https://api.example.com/v1/hook?api_key=" + urlSecret + "&mode=fast",
+		"HDR: X-API-Key: " + xApiVal,
+		"ENV: AWS_SECRET_ACCESS_KEY=" + awsSecret,
+		"STRIPE: " + stripeKey,
+		"GITLAB: " + gitlabPat,
+		"NPM: " + npmTok,
+	}, "\n")
+
+	scrubbedText := String(rawText)
+	for _, secret := range []string{"b3BlbnNzaC1rZXktdjE", urlSecret, xApiVal, awsSecret, stripeKey, gitlabPat, npmTok} {
+		if strings.Contains(scrubbedText, secret) {
+			t.Fatalf("secret %q leaked in String() output:\n%s", secret, scrubbedText)
+		}
+	}
+	if !strings.Contains(scrubbedText, "&mode=fast") {
+		t.Fatalf("expected non-secret query parameter &mode=fast preserved, got:\n%s", scrubbedText)
+	}
+
+	sess := &model.Session{
+		ID:           "trace_sec_deep",
+		Command:      "curl https://svc.local?access_token=" + urlSecret,
+		WorkspaceDir: "/home/ci_" + gitlabPat + "/repo",
+		Frames: []model.Frame{
+			{
+				Index:   1,
+				Type:    model.EventToolCall,
+				Content: "invoke deploy",
+				Tool: &model.ToolInvocation{
+					Name: "deploy",
+					Arguments: map[string]interface{}{
+						"headers": map[string]interface{}{
+							"x-api-key":     "opaqueHeaderSecret999",
+							"Authorization": "Basic dXNlcjpzZWNyZXRfcGFzc3dvcmQ=",
+						},
+						"api_keys":       []interface{}{"rawKeyOne", "rawKeyTwo"},
+						"webhook_secret": "opaqueWebhookSecret",
+					},
+				},
+			},
+		},
+	}
+
+	cleanSess := Session(sess)
+	if strings.Contains(cleanSess.WorkspaceDir, gitlabPat) {
+		t.Fatalf("WorkspaceDir leaked GitLab token: %q", cleanSess.WorkspaceDir)
+	}
+	hdrs := cleanSess.Frames[0].Tool.Arguments["headers"].(map[string]interface{})
+	if hdrs["x-api-key"] != Mask {
+		t.Fatalf("expected x-api-key masked, got %v", hdrs["x-api-key"])
+	}
+	if hdrs["Authorization"] != "Basic [REDACTED]" {
+		t.Fatalf("expected Basic auth masked, got %v", hdrs["Authorization"])
+	}
+	keysSlice := cleanSess.Frames[0].Tool.Arguments["api_keys"].([]interface{})
+	if keysSlice[0] != Mask || keysSlice[1] != Mask {
+		t.Fatalf("expected slice under sensitive key api_keys masked, got %v", keysSlice)
+	}
+	if cleanSess.Frames[0].Tool.Arguments["webhook_secret"] != Mask {
+		t.Fatalf("expected webhook_secret masked, got %v", cleanSess.Frames[0].Tool.Arguments["webhook_secret"])
+	}
+}

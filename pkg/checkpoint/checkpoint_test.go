@@ -550,3 +550,215 @@ func TestLegacyGitWorkspaceManager_PreservesGitIndexAndValidatesHashes(t *testin
 		t.Fatalf("expected working tree state 'unstaged-v3\\n', got %q", string(restoredTracked))
 	}
 }
+
+func TestTreeStore_ReadOnlyFilesDirsAndEmptyDirPruning(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+
+	// Seed baseline workspace:
+	// - locked.cfg (will later be overwritten while read-only 0444)
+	// - nested/item.go (parent 'nested' will later be replaced by a read-only file)
+	// - target_file.txt (will later be replaced by a directory containing read-only files)
+	lockedPath := filepath.Join(workDir, "locked.cfg")
+	nestedFile := filepath.Join(workDir, "nested", "item.go")
+	targetFile := filepath.Join(workDir, "target_file.txt")
+
+	_ = os.MkdirAll(filepath.Dir(nestedFile), 0755)
+	if err := os.WriteFile(lockedPath, []byte("locked=v1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nestedFile, []byte("package nested\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetFile, []byte("clean file v1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ts, err := NewTreeStore(workDir, storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+
+	snap1, err := ts.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	// Simulate adversarial post-checkpoint workspace mutations:
+	// 1. Mutate locked.cfg and mark it read-only (0444).
+	_ = os.WriteFile(lockedPath, []byte("locked=corrupted_v2\n"), 0644)
+	_ = os.Chmod(lockedPath, 0444)
+
+	// 2. Create a post-checkpoint untracked read-only file (0444).
+	strayRO := filepath.Join(workDir, "ro_sub", "stray_readonly.lock")
+	_ = os.MkdirAll(filepath.Dir(strayRO), 0755)
+	_ = os.WriteFile(strayRO, []byte("untracked read-only"), 0444)
+	_ = os.Chmod(strayRO, 0444)
+
+	// 3. Replace 'nested' directory with a read-only regular file.
+	_ = os.RemoveAll(filepath.Join(workDir, "nested"))
+	_ = os.WriteFile(filepath.Join(workDir, "nested"), []byte("blocking read-only file"), 0444)
+	_ = os.Chmod(filepath.Join(workDir, "nested"), 0444)
+
+	// 4. Replace 'target_file.txt' with a directory containing a read-only file.
+	_ = os.Remove(targetFile)
+	_ = os.MkdirAll(filepath.Join(targetFile, "inner"), 0755)
+	innerRO := filepath.Join(targetFile, "inner", "readonly_child.txt")
+	_ = os.WriteFile(innerRO, []byte("blocking dir child"), 0444)
+	_ = os.Chmod(innerRO, 0444)
+
+	// 5. Create post-checkpoint empty directories with zero files inside.
+	emptyTree := filepath.Join(workDir, "empty_post_dir", "deep_empty")
+	_ = os.MkdirAll(emptyTree, 0755)
+
+	if err := ts.RestoreSnapshot(snap1); err != nil {
+		t.Fatalf("RestoreSnapshot failed on read-only / conflicting workspace state: %v", err)
+	}
+
+	gotLocked, err := os.ReadFile(lockedPath)
+	if err != nil || string(gotLocked) != "locked=v1\n" {
+		t.Fatalf("locked.cfg not restored: %q (err=%v)", string(gotLocked), err)
+	}
+	gotNested, err := os.ReadFile(nestedFile)
+	if err != nil || string(gotNested) != "package nested\n" {
+		t.Fatalf("nested/item.go not restored over read-only blocking file: %q (err=%v)", string(gotNested), err)
+	}
+	gotTarget, err := os.ReadFile(targetFile)
+	if err != nil || string(gotTarget) != "clean file v1\n" {
+		t.Fatalf("target_file.txt not restored over read-only conflicting dir: %q (err=%v)", string(gotTarget), err)
+	}
+	if _, err := os.Stat(strayRO); !os.IsNotExist(err) {
+		t.Fatalf("expected post-checkpoint read-only file to be deleted")
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "empty_post_dir")); !os.IsNotExist(err) {
+		t.Fatalf("expected post-checkpoint empty directory tree to be pruned")
+	}
+}
+
+func TestTreeStore_CrossWorkspaceStatCacheIsolation(t *testing.T) {
+	sharedStore := t.TempDir()
+	workA := t.TempDir()
+	workB := t.TempDir()
+
+	// Both workspaces have "main.go" with identical byte length (24 bytes) and identical mtime!
+	contentA := []byte("package alpha // AAAAAA\n")
+	contentB := []byte("package bravo // BBBBBB\n")
+	if len(contentA) != len(contentB) {
+		t.Fatalf("test setup requires equal file sizes")
+	}
+
+	fixedTime := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+	fileA := filepath.Join(workA, "main.go")
+	fileB := filepath.Join(workB, "main.go")
+
+	if err := os.WriteFile(fileA, contentA, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(fileA, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileB, contentB, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(fileB, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+
+	tsA, err := NewTreeStore(workA, sharedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapA, err := tsA.CreateSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tsA.Close()
+
+	tsB, err := NewTreeStore(workB, sharedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapB, statsB, err := tsB.CreateSnapshotWithStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tsB.Close()
+
+	if snapA == snapB {
+		t.Fatalf("cross-workspace stat_cache poisoning: workB inherited workA snapshot hash %s!", snapA)
+	}
+	if statsB.CacheMisses != 1 || statsB.CacheHits != 0 {
+		t.Fatalf("expected cache miss on workB's first snapshot, got %+v", statsB)
+	}
+
+	// Re-open workA and verify workA's stat cache was preserved (not wiped by workB).
+	tsA2, err := NewTreeStore(workA, sharedStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tsA2.Close()
+	_, statsA2, err := tsA2.CreateSnapshotWithStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statsA2.CacheHits != 1 || statsA2.CacheMisses != 0 {
+		t.Fatalf("expected workA stat cache hit to survive workB snapshot, got %+v", statsA2)
+	}
+}
+
+func TestTreeStore_ManifestDigestMismatchAndCrossOSWindowsDriveValidation(t *testing.T) {
+	crossOSBadPaths := []string{
+		"C:/Windows/System32/cmd.exe",
+		"c:/users/admin/.ssh/id_rsa",
+		"D:relative_drive.go",
+		"pkg/file.txt:zone.identifier",
+	}
+	for _, bp := range crossOSBadPaths {
+		if err := validateRelPath(bp); err == nil {
+			t.Errorf("expected validateRelPath(%q) to fail across all OSes", bp)
+		}
+	}
+
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(workDir, "a.go"), []byte("package a\n"), 0644)
+
+	ts, err := NewTreeStore(workDir, storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap1, err := ts.CreateSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(workDir, "a.go"), []byte("package a\nconst V = 2\n"), 0644)
+	snap2, err := ts.CreateSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ts.Close()
+
+	// Swap snap1's manifest bytes on disk with snap2's manifest bytes so Zstd + blob hashes are valid
+	// JSON, ONLY the outer manifest SHA-256 digest mismatches snap1!
+	snap2Raw, err := os.ReadFile(filepath.Join(storeDir, "trees", snap2+".manifest.zst"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(storeDir, "trees", snap1+".manifest.zst"), snap2Raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	tsFresh, err := NewTreeStore(workDir, storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tsFresh.Close()
+
+	if _, err := tsFresh.LoadManifest(snap1); err == nil {
+		t.Fatalf("expected LoadManifest to reject swapped manifest with mismatched SHA-256 digest")
+	}
+	if err := tsFresh.RestoreSnapshot(snap1); err == nil {
+		t.Fatalf("expected RestoreSnapshot to reject swapped manifest with mismatched SHA-256 digest")
+	}
+}

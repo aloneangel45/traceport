@@ -442,9 +442,17 @@ func (s *Store) AppendFrameWithIndex(sessionID string, frame model.Frame) (model
 		}
 	}
 
+	framesPath := s.framesFilePath(sessionID)
+	repaired, repairedCount, repErr := ensureCleanFramesFile(framesPath)
+	if repErr != nil {
+		return frame, repErr
+	}
+
 	count, ok := s.frameCounts[sessionID]
-	if !ok {
-		existing, err := readFramesJSONL(s.framesFilePath(sessionID))
+	if repaired {
+		count = repairedCount
+	} else if !ok {
+		existing, err := readFramesJSONL(framesPath)
 		if err != nil && !os.IsNotExist(err) {
 			return frame, err
 		}
@@ -458,9 +466,13 @@ func (s *Store) AppendFrameWithIndex(sessionID string, frame model.Frame) (model
 	}
 	line = append(line, '\n')
 
-	f, err := os.OpenFile(s.framesFilePath(sessionID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := os.OpenFile(framesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		return frame, fmt.Errorf("open frames log: %w", err)
+		_ = os.Chmod(framesPath, 0600)
+		f, err = os.OpenFile(framesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return frame, fmt.Errorf("open frames log: %w", err)
+		}
 	}
 	_, writeErr := f.Write(line)
 	closeErr := f.Close()
@@ -473,6 +485,56 @@ func (s *Store) AppendFrameWithIndex(sessionID string, frame model.Frame) (model
 
 	s.frameCounts[sessionID] = frame.Index
 	return frame, nil
+}
+
+// ensureCleanFramesFile checks in O(1) whether path ends with '\n'. If a prior crash left a
+// partial unterminated line (or a valid final JSON line without '\n'), it atomically rewrites
+// the recovered valid frames so subsequent O_APPEND writes never concatenate onto a partial line.
+func ensureCleanFramesFile(path string) (bool, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, 0, nil
+		}
+		return false, 0, err
+	}
+	info, sErr := f.Stat()
+	if sErr != nil {
+		_ = f.Close()
+		return false, 0, sErr
+	}
+	size := info.Size()
+	if size == 0 {
+		_ = f.Close()
+		return false, 0, nil
+	}
+	var last [1]byte
+	_, rErr := f.ReadAt(last[:], size-1)
+	_ = f.Close()
+	if rErr == nil && last[0] == '\n' {
+		return false, 0, nil
+	}
+
+	frames, err := readFramesJSONL(path)
+	if err != nil {
+		return false, 0, err
+	}
+	var buf bytes.Buffer
+	for i := range frames {
+		if frames[i].Index <= 0 {
+			frames[i].Index = i + 1
+		}
+		raw, mErr := json.Marshal(frames[i])
+		if mErr != nil {
+			return false, 0, mErr
+		}
+		buf.Write(raw)
+		buf.WriteByte('\n')
+	}
+	if err := writeAtomicFile(path, buf.Bytes(), 0600); err != nil {
+		return false, 0, err
+	}
+	return true, len(frames), nil
 }
 
 // GetSession loads a complete session and all recorded frames (supporting both JSONL and legacy v1.0 JSON).
@@ -542,11 +604,14 @@ func (s *Store) loadLegacySessionLocked(sessionID string) (*model.Session, error
 	return &sess, nil
 }
 
-// ListSessions returns all recorded sessions sorted newest StartTime first.
-func (s *Store) ListSessions() ([]model.Session, error) {
+// ListSessionIDs returns all candidate session IDs present on disk (both JSONL .meta.json and legacy .json).
+func (s *Store) ListSessionIDs() ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.listSessionIDsLocked()
+}
 
+func (s *Store) listSessionIDsLocked() ([]string, error) {
 	entries, err := os.ReadDir(s.baseDir)
 	if err != nil {
 		return nil, err
@@ -583,6 +648,19 @@ func (s *Store) ListSessions() ([]model.Session, error) {
 		}
 	}
 
+	return ids, nil
+}
+
+// ListSessions returns all recorded sessions sorted newest StartTime first.
+func (s *Store) ListSessions() ([]model.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids, err := s.listSessionIDsLocked()
+	if err != nil {
+		return nil, err
+	}
+
 	sessions := make([]model.Session, 0, len(ids))
 	for _, id := range ids {
 		if sess, err := s.loadSessionLocked(id); err == nil {
@@ -591,6 +669,9 @@ func (s *Store) ListSessions() ([]model.Session, error) {
 	}
 
 	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].StartTime.Equal(sessions[j].StartTime) {
+			return sessions[i].ID > sessions[j].ID
+		}
 		return sessions[i].StartTime.After(sessions[j].StartTime)
 	})
 	return sessions, nil
@@ -612,8 +693,11 @@ func (s *Store) DeleteSession(sessionID string) error {
 		s.framesFilePath(sessionID),
 		s.legacySessionFilePath(sessionID),
 	} {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) && firstErr == nil {
-			firstErr = err
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			_ = os.Chmod(p, 0600)
+			if retryErr := os.Remove(p); retryErr != nil && !os.IsNotExist(retryErr) && firstErr == nil {
+				firstErr = retryErr
+			}
 		}
 	}
 	return firstErr
@@ -668,6 +752,7 @@ func writeAtomicFile(dest string, data []byte, perm os.FileMode) error {
 	cleanup := true
 	defer func() {
 		if cleanup {
+			_ = os.Chmod(tmpName, 0600)
 			_ = os.Remove(tmpName)
 		}
 	}()

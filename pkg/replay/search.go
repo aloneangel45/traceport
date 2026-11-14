@@ -3,7 +3,6 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -72,11 +71,7 @@ func (e *Engine) Search(opts SearchOptions) ([]SessionSearchResult, error) {
 		return nil, err
 	}
 
-	workDir, _ := os.Getwd()
-	if workDir == "" {
-		workDir = e.store.RootDir()
-	}
-	treeStore, treeErr := checkpoint.NewTreeStore(workDir, e.store.RootDir())
+	treeStore, treeErr := checkpoint.NewTreeStore(e.store.RootDir(), e.store.RootDir())
 	if treeErr == nil {
 		defer treeStore.Close()
 	}

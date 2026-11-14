@@ -50,6 +50,13 @@ type statCacheEntry struct {
 	SHA256          string `json:"sha256"`
 }
 
+type persistedStatCache struct {
+	Version    int                                  `json:"version"`
+	Workspaces map[string]map[string]statCacheEntry `json:"workspaces"`
+}
+
+var statCacheFileMu sync.Mutex
+
 // SnapshotStats tracks incremental I/O and compression activity for a CreateSnapshot call.
 type SnapshotStats struct {
 	FilesIndexed int   `json:"files_indexed"`
@@ -222,19 +229,56 @@ func (ts *TreeStore) statCachePath() string {
 	return filepath.Join(ts.storeDir, "trees", "stat_cache.json")
 }
 
+func (ts *TreeStore) workspaceCacheKey() string {
+	clean := filepath.Clean(ts.realWorkspace)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(clean)
+	}
+	return clean
+}
+
 func (ts *TreeStore) loadStatCacheLocked() {
+	statCacheFileMu.Lock()
 	data, err := os.ReadFile(ts.statCachePath())
+	statCacheFileMu.Unlock()
 	if err != nil || len(data) == 0 {
 		return
 	}
-	var loaded map[string]statCacheEntry
-	if err := json.Unmarshal(data, &loaded); err == nil && loaded != nil {
-		ts.statCache = loaded
+	var persisted persistedStatCache
+	if err := json.Unmarshal(data, &persisted); err != nil || persisted.Version < 2 || persisted.Workspaces == nil {
+		return
+	}
+	if wsEntries, ok := persisted.Workspaces[ts.workspaceCacheKey()]; ok && wsEntries != nil {
+		cp := make(map[string]statCacheEntry, len(wsEntries))
+		for k, v := range wsEntries {
+			cp[k] = v
+		}
+		ts.statCache = cp
 	}
 }
 
 func (ts *TreeStore) saveStatCacheLocked() {
-	data, err := json.Marshal(ts.statCache)
+	statCacheFileMu.Lock()
+	defer statCacheFileMu.Unlock()
+
+	var persisted persistedStatCache
+	if existing, err := os.ReadFile(ts.statCachePath()); err == nil && len(existing) > 0 {
+		if uErr := json.Unmarshal(existing, &persisted); uErr != nil || persisted.Version < 2 {
+			persisted = persistedStatCache{}
+		}
+	}
+	if persisted.Workspaces == nil {
+		persisted.Workspaces = make(map[string]map[string]statCacheEntry)
+	}
+	persisted.Version = 2
+
+	cp := make(map[string]statCacheEntry, len(ts.statCache))
+	for k, v := range ts.statCache {
+		cp[k] = v
+	}
+	persisted.Workspaces[ts.workspaceCacheKey()] = cp
+
+	data, err := json.Marshal(persisted)
 	if err != nil {
 		return
 	}
@@ -381,6 +425,9 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 			}
 			return nil
 		}
+		if !d.IsDir() && isTransientTempFile(name) {
+			return nil
+		}
 		if sameWorkAndStore {
 			if d.IsDir() && (name == "blobs" || name == "trees" || name == "dicts" || name == "sessions") {
 				return filepath.SkipDir
@@ -523,17 +570,31 @@ func (ts *TreeStore) LoadManifest(treeHash string) (*TreeManifest, error) {
 		return nil, fmt.Errorf("decompress manifest %s: %w", treeHash, err)
 	}
 
+	sum := sha256.Sum256(decoded)
+	actualHash := hex.EncodeToString(sum[:])
+	if actualHash != treeHash {
+		return nil, fmt.Errorf("manifest %s digest mismatch: got %s", treeHash, actualHash)
+	}
+
 	var manifest TreeManifest
 	if err := json.Unmarshal(decoded, &manifest); err != nil {
 		return nil, fmt.Errorf("unmarshal manifest %s: %w", treeHash, err)
 	}
 
+	seenPaths := make(map[string]struct{}, len(manifest.Files))
 	for _, f := range manifest.Files {
 		if err := validateRelPath(f.Path); err != nil {
 			return nil, fmt.Errorf("manifest %s contains unsafe path %q: %w", treeHash, f.Path, err)
 		}
+		if _, dup := seenPaths[f.Path]; dup {
+			return nil, fmt.Errorf("manifest %s contains duplicate path %q", treeHash, f.Path)
+		}
+		seenPaths[f.Path] = struct{}{}
 		if !isValidSHA256Hex(f.SHA256) {
 			return nil, fmt.Errorf("manifest %s contains invalid blob hash %q", treeHash, f.SHA256)
+		}
+		if f.Size < 0 {
+			return nil, fmt.Errorf("manifest %s contains negative file size %d for %q", treeHash, f.Size, f.Path)
 		}
 	}
 
@@ -665,6 +726,10 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 		if err != nil {
 			return nil, err
 		}
+		parentDir := filepath.Dir(targetPath)
+		if isSubpath(ts.workspaceDir, parentDir) && !sameFilePath(parentDir, ts.workspaceDir) {
+			_ = os.Chmod(parentDir, 0755)
+		}
 		if linfo, lerr := os.Lstat(targetPath); lerr == nil && linfo.Mode()&os.ModeSymlink == 0 {
 			_ = os.Chmod(targetPath, 0600)
 		}
@@ -673,7 +738,7 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 		}
 		delete(ts.statCache, rel)
 		stats.FilesDeleted++
-		ts.pruneEmptyParentsLocked(filepath.Dir(targetPath))
+		ts.pruneEmptyParentsLocked(parentDir)
 	}
 
 	// 2. Delta-restore missing or modified files; skip unchanged files in microseconds.
@@ -700,6 +765,7 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 					return nil, fmt.Errorf("remove symlink %s: %w", entry.Path, err)
 				}
 			} else if linfo.IsDir() {
+				makeTreeWritableNoSymlink(targetPath)
 				if err := os.RemoveAll(targetPath); err != nil {
 					return nil, fmt.Errorf("remove conflicting dir %s: %w", entry.Path, err)
 				}
@@ -727,6 +793,7 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 		stats.BytesWritten += int64(len(plain))
 	}
 
+	ts.pruneUntrackedEmptyDirsLocked()
 	ts.saveStatCacheLocked()
 	return stats, nil
 }
@@ -878,6 +945,9 @@ func (ts *TreeStore) listCurrentWorkspacePathsLocked() (map[string]fs.FileInfo, 
 			}
 			return nil
 		}
+		if !d.IsDir() && isTransientTempFile(name) {
+			return nil
+		}
 		if sameWorkAndStore {
 			if d.IsDir() && (name == "blobs" || name == "trees" || name == "dicts" || name == "sessions") {
 				return filepath.SkipDir
@@ -944,13 +1014,17 @@ func (ts *TreeStore) safeTargetPathLocked(rel string, createParents bool) (strin
 	cur := ts.workspaceDir
 
 	for i := 0; i < len(parts)-1; i++ {
+		parent := cur
 		cur = filepath.Join(cur, parts[i])
 		info, err := os.Lstat(cur)
 		if err != nil {
 			if os.IsNotExist(err) {
 				if createParents {
 					if mkErr := os.Mkdir(cur, 0755); mkErr != nil {
-						return "", fmt.Errorf("mkdir %s: %w", cur, mkErr)
+						_ = os.Chmod(parent, 0755)
+						if retryErr := os.Mkdir(cur, 0755); retryErr != nil {
+							return "", fmt.Errorf("mkdir %s: %w", cur, retryErr)
+						}
 					}
 				}
 				continue
@@ -962,6 +1036,8 @@ func (ts *TreeStore) safeTargetPathLocked(rel string, createParents bool) (strin
 		}
 		if !info.IsDir() {
 			if createParents {
+				_ = os.Chmod(parent, 0755)
+				_ = os.Chmod(cur, 0600)
 				if rmErr := os.Remove(cur); rmErr != nil {
 					return "", rmErr
 				}
@@ -969,6 +1045,14 @@ func (ts *TreeStore) safeTargetPathLocked(rel string, createParents bool) (strin
 					return "", mkErr
 				}
 			}
+		} else if createParents && runtime.GOOS != "windows" && info.Mode().Perm()&0200 == 0 {
+			_ = os.Chmod(cur, info.Mode().Perm()|0700)
+		}
+	}
+
+	if createParents && !sameFilePath(cur, ts.workspaceDir) {
+		if dInfo, dErr := os.Lstat(cur); dErr == nil && dInfo.IsDir() && runtime.GOOS != "windows" && dInfo.Mode().Perm()&0200 == 0 {
+			_ = os.Chmod(cur, dInfo.Mode().Perm()|0700)
 		}
 	}
 
@@ -989,11 +1073,94 @@ func (ts *TreeStore) pruneEmptyParentsLocked(dir string) {
 		if err != nil || len(entries) > 0 {
 			return
 		}
+		parent := filepath.Dir(dir)
+		if isSubpath(ts.workspaceDir, parent) && !sameFilePath(parent, ts.workspaceDir) {
+			_ = os.Chmod(parent, 0755)
+		}
+		_ = os.Chmod(dir, 0700)
 		if err := os.Remove(dir); err != nil {
 			return
 		}
-		dir = filepath.Dir(dir)
+		dir = parent
 	}
+}
+
+func (ts *TreeStore) pruneUntrackedEmptyDirsLocked() {
+	storeInsideWork := isSubpath(ts.workspaceDir, ts.storeDir) && !sameFilePath(ts.workspaceDir, ts.storeDir)
+	sameWorkAndStore := sameFilePath(ts.workspaceDir, ts.storeDir)
+
+	var dirs []string
+	_ = filepath.WalkDir(ts.workspaceDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || path == ts.workspaceDir {
+			return nil
+		}
+		if storeInsideWork && (sameFilePath(path, ts.storeDir) || isSubpath(ts.storeDir, path)) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if name == ".git" || name == ".traceport" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.IsDir() && isTransientTempFile(name) {
+			return nil
+		}
+		if sameWorkAndStore && d.IsDir() && (name == "blobs" || name == "trees" || name == "dicts" || name == "sessions") {
+			return filepath.SkipDir
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+
+	// Remove empty directories deepest-first.
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i]) > len(dirs[j])
+	})
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) > 0 {
+			continue
+		}
+		parent := filepath.Dir(dir)
+		if isSubpath(ts.workspaceDir, parent) && !sameFilePath(parent, ts.workspaceDir) {
+			_ = os.Chmod(parent, 0755)
+		}
+		_ = os.Chmod(dir, 0700)
+		_ = os.Remove(dir)
+	}
+}
+
+func makeTreeWritableNoSymlink(root string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			_ = os.Chmod(path, 0700)
+		} else {
+			_ = os.Chmod(path, 0600)
+		}
+		return nil
+	})
 }
 
 func normalizeFileMode(mode fs.FileMode) uint32 {
@@ -1018,6 +1185,12 @@ func validateRelPath(rel string) error {
 	}
 	if strings.HasPrefix(rel, "/") || filepath.VolumeName(rel) != "" {
 		return fmt.Errorf("absolute path %q not allowed", rel)
+	}
+	if len(rel) >= 2 && ((rel[0] >= 'a' && rel[0] <= 'z') || (rel[0] >= 'A' && rel[0] <= 'Z')) && rel[1] == ':' {
+		return fmt.Errorf("windows drive path %q not allowed", rel)
+	}
+	if strings.Contains(rel, ":") {
+		return fmt.Errorf("colon not allowed in canonical manifest path %q", rel)
 	}
 
 	parts := strings.Split(rel, "/")
@@ -1065,8 +1238,14 @@ func sameFilePath(a, b string) bool {
 	return ca == cb
 }
 
+func isTransientTempFile(name string) bool {
+	return strings.HasPrefix(name, ".tp-tmp-") ||
+		strings.HasPrefix(name, ".tp-meta-") ||
+		strings.HasPrefix(name, ".tp-export-")
+}
+
 func isInternalStoreArtifact(name string) bool {
-	if name == "stat_cache.json" {
+	if name == "stat_cache.json" || isTransientTempFile(name) {
 		return true
 	}
 	if strings.HasSuffix(name, ".meta.json") ||
@@ -1092,6 +1271,7 @@ func writeAtomicFile(dest string, data []byte, perm os.FileMode) error {
 	cleanup := true
 	defer func() {
 		if cleanup {
+			_ = os.Chmod(tmpName, 0600)
 			_ = os.Remove(tmpName)
 		}
 	}()
@@ -1100,22 +1280,24 @@ func writeAtomicFile(dest string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
-	if err := tmp.Chmod(perm); err != nil && runtime.GOOS != "windows" {
-		_ = tmp.Close()
-		return err
+	if runtime.GOOS != "windows" {
+		if err := tmp.Chmod(perm); err != nil {
+			_ = tmp.Close()
+			return err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 
 	if err := os.Rename(tmpName, dest); err != nil {
-		// Handle read-only target attribute on Windows.
+		// Handle read-only target attribute on Windows / POSIX.
 		_ = os.Chmod(dest, 0600)
 		if retryErr := os.Rename(tmpName, dest); retryErr != nil {
 			return retryErr
 		}
 	}
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" || perm&0200 == 0 {
 		_ = os.Chmod(dest, perm)
 	}
 	cleanup = false

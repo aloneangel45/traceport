@@ -99,12 +99,19 @@ func (e *Engine) RewindWithOptions(sessionID string, targetStep int, workspaceDi
 	defer treeStore.Close()
 
 	if opts.DryRun {
-		if snapshotHash != "" && treeStore.HasTree(snapshotHash) {
-			plan, err := treeStore.PlanRestore(snapshotHash)
-			if err != nil {
-				return nil, fmt.Errorf("compute dry-run restore plan: %w", err)
+		if snapshotHash != "" {
+			if treeStore.HasTree(snapshotHash) {
+				plan, err := treeStore.PlanRestore(snapshotHash)
+				if err != nil {
+					return nil, fmt.Errorf("compute dry-run restore plan: %w", err)
+				}
+				res.Plan = plan
+			} else {
+				wm := checkpoint.NewWorkspaceManager(absWork)
+				if !checkpoint.IsValidGitHash(snapshotHash) || !wm.IsGitRepo() {
+					return nil, fmt.Errorf("snapshot %s not found in shadow-tree store or git repository", snapshotHash)
+				}
 			}
-			res.Plan = plan
 		}
 		return res, nil
 	}
@@ -137,6 +144,7 @@ func (e *Engine) RewindWithOptions(sessionID string, targetStep int, workspaceDi
 	session.Frames = session.Frames[:targetStep]
 	session.FrameCount = len(session.Frames)
 	session.Status = fmt.Sprintf("rewound_to_step_%d", targetStep)
+	session.ExitCode = 0
 	session.EndTime = time.Time{}
 
 	if err := e.store.SaveSession(session); err != nil {
@@ -153,8 +161,14 @@ func (e *Engine) Playback(sessionID string, fromStep int, out io.Writer) error {
 		return err
 	}
 
-	if fromStep < 1 {
+	if fromStep < 0 {
+		return fmt.Errorf("from step %d out of bounds (1..%d)", fromStep, len(session.Frames))
+	}
+	if fromStep == 0 {
 		fromStep = 1
+	}
+	if len(session.Frames) > 0 && fromStep > len(session.Frames) {
+		return fmt.Errorf("from step %d out of bounds (1..%d)", fromStep, len(session.Frames))
 	}
 	startIndex := fromStep - 1
 

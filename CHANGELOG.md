@@ -5,6 +5,32 @@ All notable changes to **TracePort** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-11-14
+
+### Fixed
+- **Zero-Module Windows Installer Compatibility (`install.ps1` & `install.sh`):**
+  - Replaced `Get-FileHash`, `Expand-Archive`, and external PowerShell Utility/Management cmdlet dependencies in `install.ps1` with pure `.NET` APIs (`[System.Security.Cryptography.SHA256]::Create()`, `System.IO.Compression.ZipFile::ExtractToDirectory`, `[System.Net.WebClient]`, `[System.IO.Path]`, `[System.IO.File]`), preventing `CommandNotFoundException` in stripped `PSModulePath` / `PSModuleAutoLoadingPreference=None` environments, clearing `FILE_ATTRIBUTE_READONLY` on existing binaries before replacement, and handling nested archive paths.
+  - Updated `install.sh` to extract archives into an isolated temporary subdirectory, stage binaries onto the target filesystem before `mv -f` (preventing `ETXTBSY` / read-only overwrite errors on running Unix binaries), and updated offline fallback release tags in both installers to `v1.2.1`.
+- **Shadow-Tree Read-Only File Rollback, Stat-Cache Isolation & Integrity Hardening (`pkg/checkpoint`):**
+  - Cleared read-only file and directory bits (`0444` / `FILE_ATTRIBUTE_READONLY`) before deletion or atomic rename during `RestoreSnapshotWithStats` and `writeAtomicFile`, fixing `Access is denied` failures on Windows and read-only directory rollbacks on POSIX, and delayed target `0444` mode application until after atomic file rename so failed writes never leak read-only `.tp-tmp-*` files.
+  - Pruned untracked post-checkpoint empty directories bottom-up during `RestoreSnapshotWithStats` while preserving `.git`, `.traceport`, and active store directories, and skipped transient `.tp-*` temporary files during snapshot scans.
+  - Upgraded `trees/stat_cache.json` to workspace-scoped v2 format keyed by normalized workspace root (guarded by mutex), eliminating cross-workspace SHA-256 blob cache collisions when multiple workspaces share `TRACEPORT_HOME` or the OS config store.
+  - Added outer `sha256(decoded) == treeHash` verification, duplicate path rejection, and negative file size validation inside `LoadManifest`, plus cross-OS rejection of Windows drive letters (`C:/...`) and colons (`:`) in `validateRelPath` on Linux, macOS, and Windows.
+- **Crash-Truncated JSONL Recovery Before Append (`pkg/storage`):**
+  - Repaired `.frames.jsonl` files missing a trailing newline (e.g., after a prior `SIGKILL` mid-line write or non-newline-terminated import) via atomic rewrite in `AppendFrameWithIndex` before `O_APPEND` writes, preventing subsequent frames from concatenating onto partial trailing fragments and corrupting valid frames.
+  - Cleared read-only attributes before removing session artifacts in `DeleteSession` and added deterministic session ID tie-breaking in `ListSessions`.
+- **Expanded Credential Redaction Coverage (`pkg/redact`):**
+  - Added scrubbing for PEM/OpenSSH/PGP private key blocks (complete and crash-truncated), URL query-string secrets (`?api_key=`, `&token=`, `&access_token=`, `&client_secret=`, `&password=`, etc.), `Authorization: Basic ...`, `X-API-Key` headers, CLI/env secret assignments (`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `CLIENT_SECRET`, `DATABASE_PASSWORD`, etc.), Stripe (`sk_live_*`, `rk_live_*`, `whsec_*`), GitLab (`glpat-*`), npm (`npm_*`), and SendGrid (`SG.*`) tokens.
+  - Scrubbed `Session.WorkspaceDir`, expanded sensitive map field names (`x_api_key`, `webhook_secret`, `token`, `api_keys`, `cookie`, etc.), and masked string slices (`[]string`, `[]interface{}`) nested under sensitive tool argument keys.
+- **Safe Garbage Collection, Live Diff Path Boundaries & Markdown Export Escaping (`pkg/replay`):**
+  - Hardened `Engine.GC` to enumerate raw session IDs via `ListSessionIDs()` and verify every retained session and tree manifest loads cleanly before pruning, aborting safely rather than deleting referenced Zstd trees/blobs on unreadable metadata or manifests.
+  - Fixed `readLiveWorkspaceFiles` in `pkg/replay/diff.go` using path-boundary containment (`isPathWithinDir`) instead of raw string prefix matching (which previously misclassified sibling files like `.traceport-ci.yaml` as deleted), skipped transient `.tp-*` files, and rejected negative `--from`/`--to` step numbers.
+  - Fixed Markdown export in `pkg/replay/export.go` to truncate excerpts on valid UTF-8 rune boundaries instead of raw byte offsets, dynamically lengthen tilde code fences (`~~~~`+) when output contains tildes, and load tree manifests directly from `store.GetRootDir()` without `os.Getwd()` fallbacks across `export` and `search`.
+  - Validated missing snapshots during `rewind --dry-run`, reset `session.ExitCode` to `0` upon successful rewind, and rejected out-of-bounds `--step` values in `replay`.
+- **CLI Flag Reordering, Positional Validation & Recorder Signal Exit Codes (`cmd/traceport` & `pkg/recorder`):**
+  - Fixed `reorderFlagsFirst` in `cmd/traceport/main.go` to preserve `--` when forwarding to `flag.FlagSet` so leading-dash queries (`traceport search -- -ldflags`) are parsed as positional arguments instead of unknown flags, supported flags before `train` in `traceport dict`, validated unexpected extra positional arguments across subcommands, and propagated `session.ExitCode` for aborted sessions.
+  - Fixed Unix signal-terminated child exit codes (`128 + signal` instead of `-1`), guarded non-positive checkpoint intervals against `time.NewTicker` panics, and returned the persisted aborted `model.Session` when child process startup fails in `recorder.Runner.Record`.
+
 ## [1.2.0] - 2026-11-14
 
 ### Added
