@@ -5,6 +5,26 @@ All notable changes to **TracePort** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-11-15
+
+### Fixed
+- **Cross-Platform Line Endings, Installer Hardening & Node 24 CI Workflows (`.gitattributes`, `install.sh`, `install.ps1`, `.github/workflows`):**
+  - Added `.gitattributes` enforcing LF (`\n`) on `*.sh`, `*.go`, `*.yml`, and `*.yaml` files and CRLF (`\r\n`) on `*.ps1` scripts, with automated regression checks verifying `install.sh` contains zero `\r` bytes.
+  - Hardened `install.sh` to run `mkdir -p "${INSTALL_DIR}"` across both root (`/usr/local/bin`) and non-root branches, stage extracted binaries into temporary files inside `${INSTALL_DIR}` before atomic `mv -f`, and clean up staged artifacts on exit.
+  - Hardened `install.ps1` inside an `Install-TracePort` function scope using `throw` instead of script-scope `exit` (so `irm | iex` never terminates the caller's shell), unconditionally prepending `$PSHome\Modules` and stripping `PowerShell\7` module paths when running under Windows PowerShell `5.1` (`Desktop`), bitwise-ORing `Tls12`, and clearing `ReadOnly` attributes before binary replacement.
+  - Added `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"` to `.github/workflows/ci.yml` and `.github/workflows/release.yml`, and added explicit `permissions: contents: read` to `.github/workflows/ci.yml`.
+- **Symlinked Workspaces, Safe Symlink Rewind & Racy-Clean Stat-Cache Protection (`pkg/checkpoint`, `pkg/replay`):**
+  - Fixed symlinked and junction workspace root traversal by resolving and walking canonical `realWorkspace` paths (`filepath.EvalSymlinks`) across `TreeStore`, `collectWorkspaceSamples` (`dict train`), and `readLiveWorkspaceFiles` (`diff`), preventing 0-file snapshots in symlinked workspaces.
+  - Fixed `RestoreSnapshotWithStats` and `PlanRestore` so pre-existing non-colliding untracked workspace symlinks are preserved, while colliding post-checkpoint symlinks (including directory symlinks replacing tracked directories such as `src -> /tmp/x`) and symlinks inside newly created directories are unlinked safely before restoring files underneath them without traversing outside the workspace.
+  - Fixed `statCache` racy-clean staleness by bypassing `statCache` hits within a 2-second racy-clean window (`|now - mtime| < 2s`) and verifying `f.Stat()` post-read consistency (re-reading if `preStat != postStat`), ensuring rapid `<40ms` same-size overwrites and immediate post-restore edits always record accurate SHA-256 digests.
+- **Zstd Codec Close Guards & Uncompressed `.zst` Blob Integrity (`pkg/checkpoint`):**
+  - Guarded `c.enc == nil` and `c.dec == nil` under `c.mu.RLock()` across `Compressor.Compress`, `Decompress`, and `DecompressAuto` so calls after `Close()` return `ErrCompressorClosed` cleanly instead of panicking.
+  - Fixed `ModeUncompressed` handling of real `.zst` user workspace files across `ReadBlob`, `readBlobLocked`, `LoadManifest`, and `VerifyTree` by returning raw bytes directly whenever `sha256(raw) == expectedSHA` without invoking `DecompressAuto`.
+- **Grandchild Pipe Hang Timeout, Windows Atomic Rename Retries & Active Session GC Safety (`pkg/recorder`, `pkg/storage`, `pkg/replay`):**
+  - Configured `cmd.WaitDelay = 3 * time.Second` with pipe-backed `cmd.Stdout`/`cmd.Stderr` draining in `Runner.Record` so background grandchild processes holding inherited stdio descriptors cannot hang session recording indefinitely after child exit.
+  - Added 5-attempt `25ms` backoff retries around `os.Rename` in `writeAtomicFile` (`pkg/checkpoint/tree.go` and `pkg/storage/store.go`) to tolerate transient Windows antivirus/indexer file-sharing locks.
+  - Hardened `Engine.GC` to never prune active sessions with `Status == "running"` and to skip deleting unreferenced CAS blobs/manifests while any session is `"running"` or when modified within the last 5 minutes.
+
 ## [1.2.1] - 2026-11-14
 
 ### Fixed

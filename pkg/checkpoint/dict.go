@@ -193,8 +193,16 @@ func TrainDictionaryFromDir(workspaceDir, storeDir string) (*DictStats, error) {
 
 	var rawCompressed, dictCompressed int64
 	for _, s := range evalSamples {
-		rawCompressed += int64(len(rawComp.Compress(s)))
-		dictCompressed += int64(len(dictComp.Compress(s)))
+		encRaw, err := rawComp.Compress(s)
+		if err != nil {
+			return nil, err
+		}
+		encDict, err := dictComp.Compress(s)
+		if err != nil {
+			return nil, err
+		}
+		rawCompressed += int64(len(encRaw))
+		dictCompressed += int64(len(encDict))
 	}
 
 	var ratioRaw, ratioDict, gain float64
@@ -283,18 +291,21 @@ func LoadStoreDictionaries(storeDir string) ([]byte, [][]byte, error) {
 }
 
 func collectWorkspaceSamples(absWork, absStore string) ([][]byte, int64, error) {
-	var relPaths []string
-	storeInsideWork := isSubpath(absWork, absStore) && !sameFilePath(absWork, absStore)
-	sameWorkAndStore := sameFilePath(absWork, absStore)
+	realWork := resolveRealPath(absWork)
+	realStore := resolveRealPath(absStore)
 
-	err := filepath.WalkDir(absWork, func(path string, d fs.DirEntry, walkErr error) error {
+	var relPaths []string
+	storeInsideWork := isSubpath(realWork, realStore) && !sameFilePath(realWork, realStore)
+	sameWorkAndStore := sameFilePath(realWork, realStore)
+
+	err := filepath.WalkDir(realWork, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
-		if path == absWork {
+		if path == realWork {
 			return nil
 		}
-		if storeInsideWork && (sameFilePath(path, absStore) || isSubpath(absStore, path)) {
+		if storeInsideWork && (sameFilePath(path, realStore) || isSubpath(realStore, path)) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -302,7 +313,7 @@ func collectWorkspaceSamples(absWork, absStore string) ([][]byte, int64, error) 
 		}
 
 		name := d.Name()
-		if d.Type()&os.ModeSymlink != 0 {
+		if IsLinkMode(d.Type()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -327,7 +338,7 @@ func collectWorkspaceSamples(absWork, absStore string) ([][]byte, int64, error) 
 			return nil
 		}
 
-		rel, err := filepath.Rel(absWork, path)
+		rel, err := filepath.Rel(realWork, path)
 		if err != nil {
 			return nil
 		}
@@ -347,7 +358,7 @@ func collectWorkspaceSamples(absWork, absStore string) ([][]byte, int64, error) 
 	var totalBytes int64
 
 	for _, rel := range relPaths {
-		full := filepath.Join(absWork, filepath.FromSlash(rel))
+		full := filepath.Join(realWork, filepath.FromSlash(rel))
 		f, err := os.Open(full)
 		if err != nil {
 			continue

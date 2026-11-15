@@ -13,9 +13,15 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
+
+// racyCleanWindow is the Git-style racy-clean grace period during which statCache hits
+// are bypassed so rapid sub-tick / same-size edits or immediate post-restore edits
+// never record stale SHA-256 digests.
+const racyCleanWindow = 2 * time.Second
 
 // TreeCompressionMode selects how blobs and manifests are stored by TreeStore.
 type TreeCompressionMode int
@@ -123,6 +129,7 @@ type TreeStore struct {
 	workspaceDir  string
 	realWorkspace string
 	storeDir      string
+	realStore     string
 	mode          TreeCompressionMode
 	compressor    *Compressor
 	statCache     map[string]statCacheEntry
@@ -145,10 +152,7 @@ func NewTreeStore(workspaceDir, storeDir string, opts ...TreeOption) (*TreeStore
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace path: %w", err)
 	}
-	realWork := absWork
-	if eval, err := filepath.EvalSymlinks(absWork); err == nil {
-		realWork = eval
-	}
+	realWork := resolveRealPath(absWork)
 
 	absStore, err := filepath.Abs(storeDir)
 	if err != nil {
@@ -160,6 +164,7 @@ func NewTreeStore(workspaceDir, storeDir string, opts ...TreeOption) (*TreeStore
 			return nil, fmt.Errorf("initialize store directory %s: %w", sub, err)
 		}
 	}
+	realStore := resolveRealPath(absStore)
 
 	activeDict, allDicts, err := LoadStoreDictionaries(absStore)
 	if err != nil {
@@ -187,6 +192,7 @@ func NewTreeStore(workspaceDir, storeDir string, opts ...TreeOption) (*TreeStore
 		workspaceDir:  absWork,
 		realWorkspace: realWork,
 		storeDir:      absStore,
+		realStore:     realStore,
 		mode:          cfg.mode,
 		compressor:    comp,
 		statCache:     make(map[string]statCacheEntry),
@@ -195,6 +201,49 @@ func NewTreeStore(workspaceDir, storeDir string, opts ...TreeOption) (*TreeStore
 	}
 	ts.loadStatCacheLocked()
 	return ts, nil
+}
+
+// ResolveRealPath resolves symlinks and Windows NTFS junctions to their canonical filesystem target.
+func ResolveRealPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = filepath.Clean(p)
+	}
+	if eval, err := evalPlatformRealPath(abs); err == nil && eval != "" {
+		return filepath.Clean(eval)
+	}
+	parent := filepath.Dir(abs)
+	if parent != abs {
+		if evalParent, err := evalPlatformRealPath(parent); err == nil && evalParent != "" {
+			return filepath.Join(evalParent, filepath.Base(abs))
+		}
+	}
+	return filepath.Clean(abs)
+}
+
+// IsLinkMode reports whether mode represents a symbolic link or Windows reparse/junction entry.
+func IsLinkMode(mode fs.FileMode) bool {
+	return isPlatformLinkMode(mode)
+}
+
+func resolveRealPath(p string) string {
+	return ResolveRealPath(p)
+}
+
+func (ts *TreeStore) refreshRealPathsLocked() {
+	ts.realWorkspace = resolveRealPath(ts.workspaceDir)
+	ts.realStore = resolveRealPath(ts.storeDir)
+}
+
+func isRacyModTime(now, mtime time.Time) bool {
+	diff := now.Sub(mtime)
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff < racyCleanWindow
 }
 
 // ReloadDictionaries refreshes encoder and decoder dictionaries from <storeDir>/dicts/.
@@ -353,9 +402,17 @@ func (ts *TreeStore) CreateSnapshotWithStats() (string, SnapshotStats, error) {
 
 	manifestFile := ts.manifestPath(treeHash)
 	if _, err := os.Stat(manifestFile); os.IsNotExist(err) {
-		encoded := ts.encodeBytesLocked(canonicalBytes)
+		encoded, encErr := ts.encodeBytesLocked(canonicalBytes)
+		if encErr != nil {
+			return "", stats, fmt.Errorf("encode manifest %s: %w", treeHash, encErr)
+		}
 		if err := writeAtomicFile(manifestFile, encoded, 0600); err != nil {
 			return "", stats, fmt.Errorf("write manifest %s: %w", treeHash, err)
+		}
+	} else if ts.mode != ModeUncompressed && ts.compressor != nil {
+		// Ensure closed compressor fails closed even if an identical manifest already existed on disk.
+		if _, encErr := ts.compressor.Compress(nil); encErr != nil {
+			return "", stats, encErr
 		}
 	}
 
@@ -384,34 +441,94 @@ func (ts *TreeStore) CreateSnapshotWithStats() (string, SnapshotStats, error) {
 	return treeHash, stats, nil
 }
 
-func (ts *TreeStore) encodeBytesLocked(raw []byte) []byte {
+func (ts *TreeStore) encodeBytesLocked(raw []byte) ([]byte, error) {
 	if ts.mode == ModeUncompressed {
 		cp := make([]byte, len(raw))
 		copy(cp, raw)
-		return cp
+		return cp, nil
 	}
 	return ts.compressor.Compress(raw)
 }
 
+func readFileConsistent(path string, initialInfo fs.FileInfo) ([]byte, fs.FileInfo, bool, error) {
+	preInfo := initialInfo
+	const maxAttempts = 4
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 || preInfo == nil {
+			st, err := os.Lstat(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil, nil, false, nil
+				}
+				return nil, nil, false, err
+			}
+			if !st.Mode().IsRegular() {
+				return nil, nil, false, nil
+			}
+			preInfo = st
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil, false, nil
+			}
+			return nil, nil, false, err
+		}
+		data, readErr := io.ReadAll(f)
+		postInfo, statErr := f.Stat()
+		_ = f.Close()
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				return nil, nil, false, nil
+			}
+			return nil, nil, false, readErr
+		}
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return nil, nil, false, nil
+			}
+			return nil, nil, false, statErr
+		}
+		if !postInfo.Mode().IsRegular() {
+			return nil, nil, false, nil
+		}
+
+		sameStat := preInfo.Size() == postInfo.Size() &&
+			preInfo.ModTime().Equal(postInfo.ModTime()) &&
+			normalizeFileMode(preInfo.Mode()) == normalizeFileMode(postInfo.Mode()) &&
+			int64(len(data)) == postInfo.Size()
+		if sameStat || attempt == maxAttempts-1 {
+			return data, postInfo, true, nil
+		}
+	}
+	return nil, nil, false, nil
+}
+
 func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, error) {
-	storeInsideWork := isSubpath(ts.workspaceDir, ts.storeDir) && !sameFilePath(ts.workspaceDir, ts.storeDir)
-	sameWorkAndStore := sameFilePath(ts.workspaceDir, ts.storeDir)
+	ts.refreshRealPathsLocked()
+
+	workRoot := ts.realWorkspace
+	storeRoot := ts.realStore
+	storeInsideWork := isSubpath(workRoot, storeRoot) && !sameFilePath(workRoot, storeRoot)
+	sameWorkAndStore := sameFilePath(workRoot, storeRoot)
+	now := time.Now()
 
 	var entries []FileEntry
 
-	err := filepath.WalkDir(ts.workspaceDir, func(path string, d fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(workRoot, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if os.IsNotExist(walkErr) {
 				return nil
 			}
 			return walkErr
 		}
-		if path == ts.workspaceDir {
+		if path == workRoot {
 			return nil
 		}
 
 		// Exclude store directory if located inside workspace.
-		if storeInsideWork && (sameFilePath(path, ts.storeDir) || isSubpath(ts.storeDir, path)) {
+		if storeInsideWork && (sameFilePath(path, storeRoot) || isSubpath(storeRoot, path)) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -437,8 +554,8 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 			}
 		}
 
-		// Never follow symlinks: prevents workspace escape exfiltration.
-		if d.Type()&os.ModeSymlink != 0 {
+		// Never follow symlinks inside workspace: prevents workspace escape exfiltration.
+		if IsLinkMode(d.Type()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -452,7 +569,7 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 			return nil
 		}
 
-		relOS, err := filepath.Rel(ts.workspaceDir, path)
+		relOS, err := filepath.Rel(workRoot, path)
 		if err != nil {
 			return err
 		}
@@ -473,28 +590,30 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 		size := info.Size()
 		normMode := normalizeFileMode(info.Mode())
 
-		if cached, ok := ts.statCache[rel]; ok &&
-			cached.ModTimeUnixNano == mtimeNS &&
-			cached.Size == size &&
-			cached.Mode == normMode &&
-			ts.hasBlobLocked(cached.SHA256) {
-			stats.CacheHits++
-			entries = append(entries, FileEntry{
-				Path:   rel,
-				SHA256: cached.SHA256,
-				Size:   size,
-				Mode:   normMode,
-			})
-			return nil
+		if !isRacyModTime(now, info.ModTime()) {
+			if cached, ok := ts.statCache[rel]; ok &&
+				cached.ModTimeUnixNano == mtimeNS &&
+				cached.Size == size &&
+				cached.Mode == normMode &&
+				ts.hasBlobLocked(cached.SHA256) {
+				stats.CacheHits++
+				entries = append(entries, FileEntry{
+					Path:   rel,
+					SHA256: cached.SHA256,
+					Size:   size,
+					Mode:   normMode,
+				})
+				return nil
+			}
 		}
 
 		stats.CacheMisses++
-		data, err := os.ReadFile(path)
+		data, postInfo, exists, err := readFileConsistent(path, info)
 		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
 			return fmt.Errorf("read workspace file %s: %w", rel, err)
+		}
+		if !exists {
+			return nil
 		}
 		stats.BytesRead += int64(len(data))
 
@@ -506,7 +625,10 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 			if err := os.MkdirAll(filepath.Dir(blobFile), 0700); err != nil {
 				return fmt.Errorf("create blob fanout dir: %w", err)
 			}
-			compressed := ts.encodeBytesLocked(data)
+			compressed, encErr := ts.encodeBytesLocked(data)
+			if encErr != nil {
+				return fmt.Errorf("compress blob %s: %w", sha, encErr)
+			}
 			if err := writeAtomicFile(blobFile, compressed, 0600); err != nil {
 				return fmt.Errorf("write blob %s: %w", sha, err)
 			}
@@ -515,17 +637,19 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 		}
 
 		realSize := int64(len(data))
+		postMtimeNS := postInfo.ModTime().UnixNano()
+		postNormMode := normalizeFileMode(postInfo.Mode())
 		ts.statCache[rel] = statCacheEntry{
-			ModTimeUnixNano: mtimeNS,
+			ModTimeUnixNano: postMtimeNS,
 			Size:            realSize,
-			Mode:            normMode,
+			Mode:            postNormMode,
 			SHA256:          sha,
 		}
 		entries = append(entries, FileEntry{
 			Path:   rel,
 			SHA256: sha,
 			Size:   realSize,
-			Mode:   normMode,
+			Mode:   postNormMode,
 		})
 		return nil
 	})
@@ -565,15 +689,20 @@ func (ts *TreeStore) LoadManifest(treeHash string) (*TreeManifest, error) {
 		return nil, fmt.Errorf("manifest %s not found: %w", treeHash, err)
 	}
 
-	decoded, err := ts.compressor.DecompressAuto(raw)
-	if err != nil {
-		return nil, fmt.Errorf("decompress manifest %s: %w", treeHash, err)
-	}
-
-	sum := sha256.Sum256(decoded)
-	actualHash := hex.EncodeToString(sum[:])
-	if actualHash != treeHash {
-		return nil, fmt.Errorf("manifest %s digest mismatch: got %s", treeHash, actualHash)
+	var decoded []byte
+	rawSum := sha256.Sum256(raw)
+	if hex.EncodeToString(rawSum[:]) == treeHash {
+		decoded = raw
+	} else {
+		decoded, err = ts.compressor.DecompressAuto(raw)
+		if err != nil {
+			return nil, fmt.Errorf("decompress manifest %s: %w", treeHash, err)
+		}
+		sum := sha256.Sum256(decoded)
+		actualHash := hex.EncodeToString(sum[:])
+		if actualHash != treeHash {
+			return nil, fmt.Errorf("manifest %s digest mismatch: got %s", treeHash, actualHash)
+		}
 	}
 
 	var manifest TreeManifest
@@ -615,13 +744,25 @@ func (ts *TreeStore) ReadBlob(sha string) ([]byte, error) {
 	if !isValidSHA256Hex(sha) {
 		return nil, fmt.Errorf("invalid blob sha256 %q", sha)
 	}
+	return ts.readBlobBySHA(sha)
+}
 
-	compressed, err := os.ReadFile(ts.blobPath(sha))
+func (ts *TreeStore) readBlobBySHA(sha string) ([]byte, error) {
+	rawBlobBytes, err := os.ReadFile(ts.blobPath(sha))
 	if err != nil {
 		return nil, fmt.Errorf("blob %s missing: %w", sha, err)
 	}
 
-	plain, err := ts.compressor.DecompressAuto(compressed)
+	// If sha256(rawBlobBytes) already matches sha (e.g. ModeUncompressed storing a user .zst file
+	// whose payload begins with ZstdMagic), return rawBlobBytes directly without DecompressAuto.
+	rawSum := sha256.Sum256(rawBlobBytes)
+	if hex.EncodeToString(rawSum[:]) == sha {
+		cp := make([]byte, len(rawBlobBytes))
+		copy(cp, rawBlobBytes)
+		return cp, nil
+	}
+
+	plain, err := ts.compressor.DecompressAuto(rawBlobBytes)
 	if err != nil {
 		return nil, fmt.Errorf("blob %s decompress failed: %w", sha, err)
 	}
@@ -634,6 +775,46 @@ func (ts *TreeStore) ReadBlob(sha string) ([]byte, error) {
 	return plain, nil
 }
 
+func buildTrackedDirSet(files []FileEntry) map[string]bool {
+	dirs := map[string]bool{".": true}
+	for _, f := range files {
+		idx := strings.LastIndexByte(f.Path, '/')
+		for idx > 0 {
+			d := f.Path[:idx]
+			if dirs[d] {
+				break
+			}
+			dirs[d] = true
+			idx = strings.LastIndexByte(d, '/')
+		}
+	}
+	return dirs
+}
+
+func symlinkCollidesOrInNewDir(rel string, trackedFiles map[string]FileEntry, trackedDirs map[string]bool) bool {
+	if _, ok := trackedFiles[rel]; ok {
+		return true
+	}
+	if trackedDirs[rel] {
+		return true
+	}
+	for cur := rel; ; {
+		slash := strings.LastIndexByte(cur, '/')
+		if slash <= 0 {
+			break
+		}
+		cur = cur[:slash]
+		if _, ok := trackedFiles[cur]; ok {
+			return true
+		}
+	}
+	parent := "."
+	if slash := strings.LastIndexByte(rel, '/'); slash > 0 {
+		parent = rel[:slash]
+	}
+	return !trackedDirs[parent]
+}
+
 // PlanRestore computes a dry-run preview of workspace changes required to reach treeHash.
 func (ts *TreeStore) PlanRestore(treeHash string) (*RestorePlan, error) {
 	manifest, err := ts.LoadManifest(treeHash)
@@ -643,6 +824,8 @@ func (ts *TreeStore) PlanRestore(treeHash string) (*RestorePlan, error) {
 
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
+
+	ts.refreshRealPathsLocked()
 
 	diskFiles, err := ts.listCurrentWorkspacePathsLocked()
 	if err != nil {
@@ -672,8 +855,12 @@ func (ts *TreeStore) PlanRestore(treeHash string) (*RestorePlan, error) {
 		}
 	}
 
-	for rel := range diskFiles {
+	trackedDirs := buildTrackedDirSet(manifest.Files)
+	for rel, info := range diskFiles {
 		if _, keep := targetSet[rel]; !keep {
+			if IsLinkMode(info.Mode()) && !symlinkCollidesOrInNewDir(rel, targetSet, trackedDirs) {
+				continue
+			}
 			plan.Delete = append(plan.Delete, rel)
 		}
 	}
@@ -697,25 +884,35 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
+	ts.refreshRealPathsLocked()
+	workRoot := ts.realWorkspace
+
 	stats := &RestoreStats{TreeHash: treeHash}
+
+	targetMap := make(map[string]FileEntry, len(manifest.Files))
+	for _, e := range manifest.Files {
+		if err := validateRelPath(e.Path); err != nil {
+			return nil, err
+		}
+		targetMap[e.Path] = e
+	}
+	trackedDirs := buildTrackedDirSet(manifest.Files)
 
 	diskFiles, err := ts.listCurrentWorkspacePathsLocked()
 	if err != nil {
 		return nil, err
 	}
 
-	targetMap := make(map[string]FileEntry, len(manifest.Files))
-	for _, e := range manifest.Files {
-		if _, err := ts.safeTargetPathLocked(e.Path, false); err != nil {
-			return nil, err
-		}
-		targetMap[e.Path] = e
-	}
-
-	// 1. Delete untracked files created after target checkpoint (preserving .git and .traceport).
+	// 1. Delete untracked post-checkpoint regular files AND colliding / new-dir symlinks BEFORE
+	// restoring files underneath them (so e.g. a symlink replacing 'src/' is unlinked safely
+	// without ever traversing into its external target). Pre-existing non-colliding workspace
+	// symlinks are preserved untouched.
 	var toDelete []string
-	for rel := range diskFiles {
+	for rel, info := range diskFiles {
 		if _, ok := targetMap[rel]; !ok {
+			if IsLinkMode(info.Mode()) && !symlinkCollidesOrInNewDir(rel, targetMap, trackedDirs) {
+				continue
+			}
 			toDelete = append(toDelete, rel)
 		}
 	}
@@ -727,10 +924,10 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 			return nil, err
 		}
 		parentDir := filepath.Dir(targetPath)
-		if isSubpath(ts.workspaceDir, parentDir) && !sameFilePath(parentDir, ts.workspaceDir) {
+		if isSubpath(workRoot, parentDir) && !sameFilePath(parentDir, workRoot) {
 			_ = os.Chmod(parentDir, 0755)
 		}
-		if linfo, lerr := os.Lstat(targetPath); lerr == nil && linfo.Mode()&os.ModeSymlink == 0 {
+		if linfo, lerr := os.Lstat(targetPath); lerr == nil && !IsLinkMode(linfo.Mode()) {
 			_ = os.Chmod(targetPath, 0600)
 		}
 		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
@@ -758,9 +955,9 @@ func (ts *TreeStore) RestoreSnapshotWithStats(treeHash string) (*RestoreStats, e
 			return nil, err
 		}
 
-		// If target is currently a directory or symlink, remove it before atomic replacement.
+		// If target is currently a directory or symlink, remove/unlink it before atomic replacement.
 		if linfo, err := os.Lstat(targetPath); err == nil {
-			if linfo.Mode()&os.ModeSymlink != 0 {
+			if IsLinkMode(linfo.Mode()) {
 				if err := os.Remove(targetPath); err != nil {
 					return nil, fmt.Errorf("remove symlink %s: %w", entry.Path, err)
 				}
@@ -809,15 +1006,20 @@ func (ts *TreeStore) VerifyTree(treeHash string) (*TreeVerifyResult, error) {
 		return nil, fmt.Errorf("manifest %s missing: %w", treeHash, err)
 	}
 
-	decodedManifest, err := ts.compressor.DecompressAuto(rawManifest)
-	if err != nil {
-		return nil, fmt.Errorf("manifest %s corrupt zstd stream: %w", treeHash, err)
-	}
-
-	sum := sha256.Sum256(decodedManifest)
-	actualTreeHash := hex.EncodeToString(sum[:])
-	if actualTreeHash != treeHash {
-		return nil, fmt.Errorf("manifest %s digest mismatch: got %s", treeHash, actualTreeHash)
+	var decodedManifest []byte
+	rawSum := sha256.Sum256(rawManifest)
+	if hex.EncodeToString(rawSum[:]) == treeHash {
+		decodedManifest = rawManifest
+	} else {
+		decodedManifest, err = ts.compressor.DecompressAuto(rawManifest)
+		if err != nil {
+			return nil, fmt.Errorf("manifest %s corrupt zstd stream: %w", treeHash, err)
+		}
+		sum := sha256.Sum256(decodedManifest)
+		actualTreeHash := hex.EncodeToString(sum[:])
+		if actualTreeHash != treeHash {
+			return nil, fmt.Errorf("manifest %s digest mismatch: got %s", treeHash, actualTreeHash)
+		}
 	}
 
 	var manifest TreeManifest
@@ -857,19 +1059,7 @@ func (ts *TreeStore) VerifyTree(treeHash string) (*TreeVerifyResult, error) {
 }
 
 func (ts *TreeStore) readBlobLocked(sha string) ([]byte, error) {
-	compressed, err := os.ReadFile(ts.blobPath(sha))
-	if err != nil {
-		return nil, fmt.Errorf("blob %s missing: %w", sha, err)
-	}
-	plain, err := ts.compressor.DecompressAuto(compressed)
-	if err != nil {
-		return nil, fmt.Errorf("blob %s decompress failed: %w", sha, err)
-	}
-	sum := sha256.Sum256(plain)
-	if hex.EncodeToString(sum[:]) != sha {
-		return nil, fmt.Errorf("blob %s sha256 integrity mismatch", sha)
-	}
-	return plain, nil
+	return ts.readBlobBySHA(sha)
 }
 
 func (ts *TreeStore) fileMatchesEntryLocked(entry FileEntry, info fs.FileInfo) bool {
@@ -879,23 +1069,26 @@ func (ts *TreeStore) fileMatchesEntryLocked(entry FileEntry, info fs.FileInfo) b
 	mtimeNS := info.ModTime().UnixNano()
 	normMode := normalizeFileMode(info.Mode())
 
-	if cached, ok := ts.statCache[entry.Path]; ok &&
-		cached.ModTimeUnixNano == mtimeNS &&
-		cached.Size == info.Size() &&
-		cached.Mode == normMode &&
-		cached.SHA256 == entry.SHA256 {
-		return true
+	if !isRacyModTime(time.Now(), info.ModTime()) {
+		if cached, ok := ts.statCache[entry.Path]; ok &&
+			cached.ModTimeUnixNano == mtimeNS &&
+			cached.Size == info.Size() &&
+			cached.Mode == normMode &&
+			cached.SHA256 == entry.SHA256 {
+			return true
+		}
 	}
 
-	fullPath := filepath.Join(ts.workspaceDir, filepath.FromSlash(entry.Path))
+	fullPath := filepath.Join(ts.realWorkspace, filepath.FromSlash(entry.Path))
 	f, err := os.Open(fullPath)
 	if err != nil {
 		return false
 	}
 	h := sha256.New()
 	_, copyErr := io.Copy(h, f)
+	postInfo, statErr := f.Stat()
 	_ = f.Close()
-	if copyErr != nil {
+	if copyErr != nil || statErr != nil || !postInfo.Mode().IsRegular() || postInfo.Size() != entry.Size {
 		return false
 	}
 	diskSHA := hex.EncodeToString(h.Sum(nil))
@@ -908,30 +1101,32 @@ func (ts *TreeStore) fileMatchesEntryLocked(entry FileEntry, info fs.FileInfo) b
 	}
 
 	ts.statCache[entry.Path] = statCacheEntry{
-		ModTimeUnixNano: mtimeNS,
-		Size:            info.Size(),
-		Mode:            normMode,
+		ModTimeUnixNano: postInfo.ModTime().UnixNano(),
+		Size:            postInfo.Size(),
+		Mode:            normalizeFileMode(postInfo.Mode()),
 		SHA256:          diskSHA,
 	}
 	return true
 }
 
 func (ts *TreeStore) listCurrentWorkspacePathsLocked() (map[string]fs.FileInfo, error) {
-	storeInsideWork := isSubpath(ts.workspaceDir, ts.storeDir) && !sameFilePath(ts.workspaceDir, ts.storeDir)
-	sameWorkAndStore := sameFilePath(ts.workspaceDir, ts.storeDir)
+	workRoot := ts.realWorkspace
+	storeRoot := ts.realStore
+	storeInsideWork := isSubpath(workRoot, storeRoot) && !sameFilePath(workRoot, storeRoot)
+	sameWorkAndStore := sameFilePath(workRoot, storeRoot)
 	result := make(map[string]fs.FileInfo)
 
-	err := filepath.WalkDir(ts.workspaceDir, func(path string, d fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(workRoot, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if os.IsNotExist(walkErr) {
 				return nil
 			}
 			return walkErr
 		}
-		if path == ts.workspaceDir {
+		if path == workRoot {
 			return nil
 		}
-		if storeInsideWork && (sameFilePath(path, ts.storeDir) || isSubpath(ts.storeDir, path)) {
+		if storeInsideWork && (sameFilePath(path, storeRoot) || isSubpath(storeRoot, path)) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -957,10 +1152,8 @@ func (ts *TreeStore) listCurrentWorkspacePathsLocked() (map[string]fs.FileInfo, 
 			}
 		}
 
-		if d.Type()&os.ModeSymlink != 0 {
-			// Record untracked symlinks as removable files if created post-checkpoint,
-			// without following them into external directories.
-			relOS, err := filepath.Rel(ts.workspaceDir, path)
+		if IsLinkMode(d.Type()) {
+			relOS, err := filepath.Rel(workRoot, path)
 			if err == nil {
 				rel := filepath.ToSlash(relOS)
 				if validateRelPath(rel) == nil {
@@ -982,7 +1175,7 @@ func (ts *TreeStore) listCurrentWorkspacePathsLocked() (map[string]fs.FileInfo, 
 			return nil
 		}
 
-		relOS, err := filepath.Rel(ts.workspaceDir, path)
+		relOS, err := filepath.Rel(workRoot, path)
 		if err != nil {
 			return err
 		}
@@ -1010,8 +1203,9 @@ func (ts *TreeStore) safeTargetPathLocked(rel string, createParents bool) (strin
 		return "", err
 	}
 
+	workRoot := ts.realWorkspace
 	parts := strings.Split(rel, "/")
-	cur := ts.workspaceDir
+	cur := workRoot
 
 	for i := 0; i < len(parts)-1; i++ {
 		parent := cur
@@ -1031,7 +1225,7 @@ func (ts *TreeStore) safeTargetPathLocked(rel string, createParents bool) (strin
 			}
 			return "", err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if IsLinkMode(info.Mode()) {
 			return "", fmt.Errorf("security violation: refusing to traverse symlink directory %q", cur)
 		}
 		if !info.IsDir() {
@@ -1050,21 +1244,22 @@ func (ts *TreeStore) safeTargetPathLocked(rel string, createParents bool) (strin
 		}
 	}
 
-	if createParents && !sameFilePath(cur, ts.workspaceDir) {
+	if createParents && !sameFilePath(cur, workRoot) {
 		if dInfo, dErr := os.Lstat(cur); dErr == nil && dInfo.IsDir() && runtime.GOOS != "windows" && dInfo.Mode().Perm()&0200 == 0 {
 			_ = os.Chmod(cur, dInfo.Mode().Perm()|0700)
 		}
 	}
 
 	target := filepath.Join(cur, parts[len(parts)-1])
-	if !isSubpath(ts.workspaceDir, target) || sameFilePath(ts.workspaceDir, target) {
+	if !isSubpath(workRoot, target) || sameFilePath(workRoot, target) {
 		return "", fmt.Errorf("security violation: path %q escapes workspace", rel)
 	}
 	return target, nil
 }
 
 func (ts *TreeStore) pruneEmptyParentsLocked(dir string) {
-	for !sameFilePath(dir, ts.workspaceDir) && isSubpath(ts.workspaceDir, dir) {
+	workRoot := ts.realWorkspace
+	for !sameFilePath(dir, workRoot) && isSubpath(workRoot, dir) {
 		base := filepath.Base(dir)
 		if base == ".git" || base == ".traceport" {
 			return
@@ -1074,7 +1269,7 @@ func (ts *TreeStore) pruneEmptyParentsLocked(dir string) {
 			return
 		}
 		parent := filepath.Dir(dir)
-		if isSubpath(ts.workspaceDir, parent) && !sameFilePath(parent, ts.workspaceDir) {
+		if isSubpath(workRoot, parent) && !sameFilePath(parent, workRoot) {
 			_ = os.Chmod(parent, 0755)
 		}
 		_ = os.Chmod(dir, 0700)
@@ -1086,15 +1281,17 @@ func (ts *TreeStore) pruneEmptyParentsLocked(dir string) {
 }
 
 func (ts *TreeStore) pruneUntrackedEmptyDirsLocked() {
-	storeInsideWork := isSubpath(ts.workspaceDir, ts.storeDir) && !sameFilePath(ts.workspaceDir, ts.storeDir)
-	sameWorkAndStore := sameFilePath(ts.workspaceDir, ts.storeDir)
+	workRoot := ts.realWorkspace
+	storeRoot := ts.realStore
+	storeInsideWork := isSubpath(workRoot, storeRoot) && !sameFilePath(workRoot, storeRoot)
+	sameWorkAndStore := sameFilePath(workRoot, storeRoot)
 
 	var dirs []string
-	_ = filepath.WalkDir(ts.workspaceDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || path == ts.workspaceDir {
+	_ = filepath.WalkDir(workRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || path == workRoot {
 			return nil
 		}
-		if storeInsideWork && (sameFilePath(path, ts.storeDir) || isSubpath(ts.storeDir, path)) {
+		if storeInsideWork && (sameFilePath(path, storeRoot) || isSubpath(storeRoot, path)) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -1113,7 +1310,7 @@ func (ts *TreeStore) pruneUntrackedEmptyDirsLocked() {
 		if sameWorkAndStore && d.IsDir() && (name == "blobs" || name == "trees" || name == "dicts" || name == "sessions") {
 			return filepath.SkipDir
 		}
-		if d.Type()&os.ModeSymlink != 0 {
+		if IsLinkMode(d.Type()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -1135,7 +1332,7 @@ func (ts *TreeStore) pruneUntrackedEmptyDirsLocked() {
 			continue
 		}
 		parent := filepath.Dir(dir)
-		if isSubpath(ts.workspaceDir, parent) && !sameFilePath(parent, ts.workspaceDir) {
+		if isSubpath(workRoot, parent) && !sameFilePath(parent, workRoot) {
 			_ = os.Chmod(parent, 0755)
 		}
 		_ = os.Chmod(dir, 0700)
@@ -1148,7 +1345,7 @@ func makeTreeWritableNoSymlink(root string) {
 		if err != nil {
 			return nil
 		}
-		if d.Type()&os.ModeSymlink != 0 {
+		if IsLinkMode(d.Type()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -1290,12 +1487,18 @@ func writeAtomicFile(dest string, data []byte, perm os.FileMode) error {
 		return err
 	}
 
-	if err := os.Rename(tmpName, dest); err != nil {
-		// Handle read-only target attribute on Windows / POSIX.
-		_ = os.Chmod(dest, 0600)
-		if retryErr := os.Rename(tmpName, dest); retryErr != nil {
-			return retryErr
+	var renameErr error
+	for attempt := 0; attempt <= 5; attempt++ {
+		if attempt > 0 {
+			_ = os.Chmod(dest, 0600)
+			time.Sleep(25 * time.Millisecond)
 		}
+		if renameErr = os.Rename(tmpName, dest); renameErr == nil {
+			break
+		}
+	}
+	if renameErr != nil {
+		return renameErr
 	}
 	if runtime.GOOS != "windows" || perm&0200 == 0 {
 		_ = os.Chmod(dest, perm)

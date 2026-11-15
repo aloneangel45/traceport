@@ -2,12 +2,19 @@ package replay
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aloneangel45/traceport/pkg/checkpoint"
+	"github.com/aloneangel45/traceport/pkg/model"
 )
+
+// gcRecentBlobGracePeriod protects newly written unreferenced blobs and manifests from
+// concurrent TOCTOU deletion if an in-flight snapshot is writing CAS objects during GC.
+const gcRecentBlobGracePeriod = 5 * time.Minute
 
 // GCOptions configures session pruning and unreferenced zstd blob sweeping.
 type GCOptions struct {
@@ -30,8 +37,22 @@ type GCReport struct {
 	CompressionRatioPct     float64 `json:"compression_ratio_pct"`
 }
 
+func isRunningSessionStatus(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), "running")
+}
+
+func isRecentCASArtifact(info fs.FileInfo, now time.Time) bool {
+	if info == nil {
+		return false
+	}
+	age := now.Sub(info.ModTime())
+	return age >= -gcRecentBlobGracePeriod && age < gcRecentBlobGracePeriod
+}
+
 // GC prunes old sessions beyond opts.Keep (when Keep >= 0) and sweeps unreferenced
 // Zstandard manifests and content-addressed blobs from the TracePort store.
+// Active sessions with Status == "running" are never pruned, and unreferenced CAS
+// blobs are skipped when any session is "running" or when modified within the last 5 minutes.
 func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 	allIDs, err := e.store.ListSessionIDs()
 	if err != nil {
@@ -44,8 +65,12 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 	}
 
 	loadedIDs := make(map[string]bool, len(sessions))
+	hasRunningSession := false
 	for _, s := range sessions {
 		loadedIDs[s.ID] = true
+		if isRunningSessionStatus(s.Status) {
+			hasRunningSession = true
+		}
 	}
 	// Never sweep manifests or blobs if any session on disk failed to decode; otherwise GC would
 	// treat that session's referenced trees and blobs as unreachable and permanently delete them.
@@ -60,12 +85,17 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 		DryRun: opts.DryRun,
 	}
 
-	retained := sessions
+	var retained []model.Session
 	var prunedIDs []string
-	if opts.Keep >= 0 && len(sessions) > opts.Keep {
-		retained = sessions[:opts.Keep]
-		for _, s := range sessions[opts.Keep:] {
-			prunedIDs = append(prunedIDs, s.ID)
+	if opts.Keep < 0 {
+		retained = sessions
+	} else {
+		for i, s := range sessions {
+			if i < opts.Keep || isRunningSessionStatus(s.Status) {
+				retained = append(retained, s)
+			} else {
+				prunedIDs = append(prunedIDs, s.ID)
+			}
 		}
 	}
 	report.SessionsRetained = len(retained)
@@ -123,6 +153,8 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 		}
 	}
 
+	now := time.Now()
+
 	// Sweep unreferenced manifests in <rootDir>/trees/.
 	treesDir := filepath.Join(rootDir, "trees")
 	if tEntries, tErr := os.ReadDir(treesDir); tErr == nil {
@@ -132,13 +164,16 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 			}
 			hash := strings.TrimSuffix(te.Name(), ".manifest.zst")
 			fullPath := filepath.Join(treesDir, te.Name())
+			info, iErr := te.Info()
 			var fSize int64
-			if info, iErr := te.Info(); iErr == nil {
+			if iErr == nil {
 				fSize = info.Size()
 			}
-			if reachableTrees[hash] {
+			if reachableTrees[hash] || hasRunningSession || isRecentCASArtifact(info, now) {
 				report.TreesRetained++
-				report.RetainedCompressedBytes += fSize
+				if reachableTrees[hash] {
+					report.RetainedCompressedBytes += fSize
+				}
 			} else {
 				report.TreesRemoved++
 				report.BytesReclaimed += fSize
@@ -168,14 +203,18 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 				}
 				sha := fan.Name() + strings.TrimSuffix(be.Name(), ".zst")
 				fullPath := filepath.Join(fanDir, be.Name())
+				info, iErr := be.Info()
 				var fSize int64
-				if info, iErr := be.Info(); iErr == nil {
+				if iErr == nil {
 					fSize = info.Size()
 				}
 				if logicalSize, keep := reachableBlobs[sha]; keep {
 					report.BlobsRetained++
 					report.RetainedCompressedBytes += fSize
 					report.RetainedLogicalBytes += logicalSize
+				} else if hasRunningSession || isRecentCASArtifact(info, now) {
+					// Protect in-flight or recently written blobs from TOCTOU deletion.
+					report.BlobsRetained++
 				} else {
 					report.BlobsRemoved++
 					report.BytesReclaimed += fSize
@@ -185,7 +224,7 @@ func (e *Engine) GC(opts GCOptions) (*GCReport, error) {
 					}
 				}
 			}
-			if !opts.DryRun && removedInFan == len(bEntries) {
+			if !opts.DryRun && removedInFan > 0 && removedInFan == len(bEntries) {
 				_ = os.Chmod(fanDir, 0700)
 				_ = os.Remove(fanDir)
 			}

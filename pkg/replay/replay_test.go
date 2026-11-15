@@ -3,7 +3,9 @@ package replay
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -187,10 +189,13 @@ func TestEngine_DiffVerifyAndGC(t *testing.T) {
 	}
 
 	// 3. Test GC dry-run then live GC keeping 1 session.
-	// Add an orphan unreferenced blob to verify sweep.
+	// Add an orphan unreferenced blob (aged beyond the 5-minute active-recording grace window) to verify sweep.
 	orphanDir := filepath.Join(store.RootDir(), "blobs", "ff")
 	_ = os.MkdirAll(orphanDir, 0700)
-	_ = os.WriteFile(filepath.Join(orphanDir, strings.Repeat("0", 62)+".zst"), []byte("orphan"), 0600)
+	orphanBlob := filepath.Join(orphanDir, strings.Repeat("0", 62)+".zst")
+	_ = os.WriteFile(orphanBlob, []byte("orphan"), 0600)
+	aged := time.Now().Add(-10 * time.Minute)
+	_ = os.Chtimes(orphanBlob, aged, aged)
 
 	dryGC, err := eng.GC(GCOptions{Keep: 1, DryRun: true})
 	if err != nil {
@@ -467,5 +472,153 @@ func TestEngine_ExportMarkdownUTF8BoundaryAndTildeFenceEscape(t *testing.T) {
 	}
 	if !strings.Contains(string(mdBytes), "~~~~~~text\n") {
 		t.Fatalf("expected 6-tilde outer fence to escape embedded 5-tilde sequence:\n%s", string(mdBytes)[:400])
+	}
+}
+
+func TestEngine_SymlinkedWorkspaceLiveDiff(t *testing.T) {
+	realWork := filepath.Join(t.TempDir(), "real_work")
+	if err := os.MkdirAll(filepath.Join(realWork, "pkg"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realWork, "pkg", "core.go"), []byte("package pkg\nconst V = 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkedWork := filepath.Join(t.TempDir(), "linked_work")
+	if err := os.Symlink(realWork, linkedWork); err != nil {
+		if runtime.GOOS == "windows" {
+			if out, jErr := exec.Command("cmd.exe", "/c", "mklink", "/J", linkedWork, realWork).CombinedOutput(); jErr != nil {
+				t.Skipf("directory symlink/junction unavailable: %v / %v (%s)", err, jErr, string(out))
+			}
+		} else {
+			t.Fatalf("symlink failed: %v", err)
+		}
+	}
+
+	storeDir := filepath.Join(t.TempDir(), "sessions")
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts, err := checkpoint.NewTreeStore(linkedWork, store.RootDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ts.CreateSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ts.Close()
+
+	sess := &model.Session{
+		ID:           "trace_symlink_diff",
+		Command:      "go test",
+		WorkspaceDir: linkedWork,
+		StartTime:    time.Now(),
+		Status:       "completed",
+		Frames: []model.Frame{
+			{Index: 1, Timestamp: time.Now(), Type: model.EventCheckpoint, Content: "Initial", GitSnapshot: snap},
+		},
+	}
+	if err := store.SaveSession(sess); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := NewEngine(store)
+
+	// 1. Unchanged symlinked workspace live diff must report 0 changes (NOT false deletion!).
+	rep0, err := eng.DiffSession(sess.ID, 1, 0, linkedWork)
+	if err != nil {
+		t.Fatalf("DiffSession on symlinked workspace failed: %v", err)
+	}
+	if len(rep0.Changes) != 0 {
+		t.Fatalf("expected 0 changes on unchanged symlinked workspace, got %+v", rep0.Changes)
+	}
+
+	// 2. Live edit inside symlinked workspace must be detected as 1 modification.
+	_ = os.WriteFile(filepath.Join(linkedWork, "pkg", "core.go"), []byte("package pkg\nconst V = 2\n"), 0644)
+	rep1, err := eng.DiffSession(sess.ID, 1, 0, linkedWork)
+	if err != nil {
+		t.Fatalf("DiffSession after edit failed: %v", err)
+	}
+	if rep1.FilesMod != 1 || rep1.FilesDel != 0 {
+		t.Fatalf("expected 1 modified file and 0 deleted files on symlinked workspace, got %+v", rep1)
+	}
+}
+
+func TestEngine_GCProtectsRunningSessionsAndRecentBlobs(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := filepath.Join(t.TempDir(), "sessions")
+
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Create an older "running" session (must NEVER be pruned even when Keep == 0 or Keep == 1!).
+	runningSess, _, _ := buildMultiStepTestSession(t, store, workDir, "trace_active_running")
+	runningSess.Status = "running"
+	runningSess.StartTime = time.Now().Add(-3 * time.Hour)
+	if err := store.UpdateSessionMeta(runningSess); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Create a newer completed session.
+	doneWork := t.TempDir()
+	doneSess, _, _ := buildMultiStepTestSession(t, store, doneWork, "trace_done_recent")
+	doneSess.Status = "completed"
+	if err := store.UpdateSessionMeta(doneSess); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Create both an aged (>10m) unreferenced CAS blob AND a brand-new (<5m) unreferenced CAS blob.
+	orphanDir := filepath.Join(store.RootDir(), "blobs", "ee")
+	_ = os.MkdirAll(orphanDir, 0700)
+	agedOrphan := filepath.Join(orphanDir, strings.Repeat("a", 62)+".zst")
+	freshOrphan := filepath.Join(orphanDir, strings.Repeat("b", 62)+".zst")
+	_ = os.WriteFile(agedOrphan, []byte("aged-orphan-blob"), 0600)
+	_ = os.WriteFile(freshOrphan, []byte("fresh-active-blob"), 0600)
+	oldTime := time.Now().Add(-15 * time.Minute)
+	_ = os.Chtimes(agedOrphan, oldTime, oldTime)
+
+	eng := NewEngine(store)
+
+	// While a session has Status == "running":
+	// - Running session is NEVER pruned (even with Keep: 0!).
+	// - Unreferenced CAS blobs are NOT swept at all while any session is "running"!
+	repWhileRunning, err := eng.GC(GCOptions{Keep: 0, DryRun: false})
+	if err != nil {
+		t.Fatalf("GC while session running failed: %v", err)
+	}
+	if _, err := store.GetSession(runningSess.ID); err != nil {
+		t.Fatalf("CRITICAL: GC pruned an active 'running' session: %v", err)
+	}
+	if repWhileRunning.BlobsRemoved != 0 || repWhileRunning.TreesRemoved != 0 {
+		t.Fatalf("expected 0 blobs/trees swept while a session is 'running', got %+v", repWhileRunning)
+	}
+	if _, err := os.Stat(agedOrphan); err != nil {
+		t.Fatalf("expected agedOrphan preserved while a session is 'running'")
+	}
+
+	// Mark the running session as completed; now GC must sweep agedOrphan (>5m)
+	// while still protecting freshOrphan (<5m grace window)!
+	runningSess.Status = "completed"
+	if err := store.UpdateSessionMeta(runningSess); err != nil {
+		t.Fatal(err)
+	}
+
+	repAfterDone, err := eng.GC(GCOptions{Keep: 1, DryRun: false})
+	if err != nil {
+		t.Fatalf("GC after completion failed: %v", err)
+	}
+	if repAfterDone.BlobsRemoved < 1 {
+		t.Fatalf("expected agedOrphan to be swept once no session is 'running', got %+v", repAfterDone)
+	}
+	if _, err := os.Stat(agedOrphan); !os.IsNotExist(err) {
+		t.Fatalf("expected agedOrphan to be deleted after completion")
+	}
+	if _, err := os.Stat(freshOrphan); err != nil {
+		t.Fatalf("expected freshOrphan (<5m old) to be protected by GC grace period, err=%v", err)
 	}
 }

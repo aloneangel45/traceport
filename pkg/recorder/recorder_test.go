@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,6 +62,26 @@ func TestRecorderHelperProcess(t *testing.T) {
 		_ = os.WriteFile("stray_debug.log", []byte("temporary crash dump"), 0644)
 		fmt.Fprintln(os.Stderr, "step 3: compilation failed in auth.go")
 		os.Exit(42)
+
+	case "sleep_grandchild":
+		time.Sleep(15 * time.Second)
+		os.Exit(0)
+
+	case "spawn_leaky_grandchild":
+		bg := exec.Command(os.Args[0], "-test.run=TestRecorderHelperProcess", "--", "sleep_grandchild")
+		bg.Dir = os.TempDir()
+		bg.Stdout = os.Stdout
+		bg.Stderr = os.Stderr
+		if err := bg.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "spawn grandchild failed: %v\n", err)
+			os.Exit(3)
+		}
+		if len(args) > 1 && args[1] != "" {
+			_ = os.WriteFile(args[1], []byte(fmt.Sprintf("%d", bg.Process.Pid)), 0600)
+		}
+		_ = bg.Process.Release()
+		fmt.Println("CHILD_DONE_WITH_GRANDCHILD")
+		os.Exit(0)
 	}
 	os.Exit(0)
 }
@@ -240,4 +261,64 @@ func TestRunner_ZeroCheckpointIntervalAndStartFailureSession(t *testing.T) {
 		t.Fatalf("reloaded session mismatch: status=%q exit=%d", reloaded.Status, reloaded.ExitCode)
 	}
 }
+
+func TestRunner_GrandchildInheritedPipeWaitDelay(t *testing.T) {
+	if DefaultWaitDelay != 3*time.Second {
+		t.Fatalf("expected DefaultWaitDelay == 3s, got %v", DefaultWaitDelay)
+	}
+
+	t.Setenv("TRACEPORT_TEST_HELPER", "1")
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+
+	store, err := storage.NewStoreWithPath(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	t.Cleanup(func() {
+		if raw, err := os.ReadFile(pidFile); err == nil {
+			var pid int
+			if _, sErr := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &pid); sErr == nil && pid > 0 {
+				if proc, fErr := os.FindProcess(pid); fErr == nil {
+					_ = proc.Kill()
+					_, _ = proc.Wait()
+				}
+			}
+		}
+	})
+
+	runner := NewRunner(store, workDir)
+	runner.waitDelay = 250 * time.Millisecond
+	runner.Stdin = nil
+	runner.Stdout = io.Discard
+	runner.Stderr = io.Discard
+
+	start := time.Now()
+	sess, err := runner.Record(os.Args[0], []string{"-test.run=TestRecorderHelperProcess", "--", "spawn_leaky_grandchild", pidFile})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("expected clean exit when grandchild leaks pipes beyond WaitDelay, got err=%v", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("Record hung waiting on grandchild inherited pipes (elapsed=%v)", elapsed)
+	}
+	if sess.Status != "completed" || sess.ExitCode != 0 {
+		t.Fatalf("expected completed exit=0, got status=%q exit=%d", sess.Status, sess.ExitCode)
+	}
+
+	sawChildDone := false
+	for _, fr := range sess.Frames {
+		if strings.Contains(fr.Content, "CHILD_DONE_WITH_GRANDCHILD") {
+			sawChildDone = true
+			break
+		}
+	}
+	if !sawChildDone {
+		t.Fatalf("expected CHILD_DONE_WITH_GRANDCHILD frame in recorded session")
+	}
+}
+
 

@@ -88,7 +88,7 @@ if [ -z "${BASE_URL}" ]; then
     fi
 
     if [ -z "${TAG}" ]; then
-        TAG="v1.2.1"
+        TAG="v1.2.2"
         log_warn "GitHub API unavailable; falling back to release ${TAG}"
     fi
 
@@ -103,7 +103,11 @@ DOWNLOAD_URL="${BASE_URL}/${ARCHIVE_NAME}"
 CHECKSUMS_URL="${BASE_URL}/checksums.txt"
 
 TMP_DIR="$(mktemp -d)"
+STAGED_BIN=""
 cleanup() {
+    if [ -n "${STAGED_BIN}" ] && [ -e "${STAGED_BIN}" ]; then
+        rm -f "${STAGED_BIN}"
+    fi
     rm -rf "${TMP_DIR}"
 }
 trap cleanup EXIT
@@ -153,15 +157,17 @@ if [ -n "${TRACEPORT_INSTALL_DIR:-}" ]; then
     mkdir -p "${INSTALL_DIR}"
 elif [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ]; then
     INSTALL_DIR="/usr/local/bin"
+    mkdir -p "${INSTALL_DIR}"
 else
     INSTALL_DIR="${HOME}/.local/bin"
     mkdir -p "${INSTALL_DIR}"
 fi
 
-STAGED_BIN="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
-cp "${EXTRACTED_BIN}" "${STAGED_BIN}"
+STAGED_BIN="$(mktemp "${INSTALL_DIR}/.${BINARY_NAME}.tmp.XXXXXX" 2>/dev/null || printf "%s/.%s.tmp.%s" "${INSTALL_DIR}" "${BINARY_NAME}" "$$")"
+cp -f "${EXTRACTED_BIN}" "${STAGED_BIN}"
 chmod 0755 "${STAGED_BIN}"
 mv -f "${STAGED_BIN}" "${INSTALL_DIR}/${BINARY_NAME}"
+STAGED_BIN=""
 
 log_ok "installed ${INSTALL_DIR}/${BINARY_NAME}"
 

@@ -214,17 +214,22 @@ func resolveSnapshotAtOrBefore(frames []model.Frame, step int) string {
 	return ""
 }
 
+func resolveRealDiffPath(p string) string {
+	return checkpoint.ResolveRealPath(p)
+}
+
 func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, error) {
 	absWork, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, err
 	}
-	absStore, _ := filepath.Abs(storeRoot)
-	sameWorkStore := sameWorkspacePath(absWork, absStore)
+	realWork := resolveRealDiffPath(absWork)
+	realStore := resolveRealDiffPath(storeRoot)
+	sameWorkStore := realStore != "" && sameWorkspacePath(realWork, realStore)
 
 	out := make(map[string]diffBlobRef)
-	err = filepath.WalkDir(absWork, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || path == absWork {
+	err = filepath.WalkDir(realWork, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || path == realWork {
 			return nil
 		}
 		name := d.Name()
@@ -237,7 +242,7 @@ func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, 
 		if !d.IsDir() && (strings.HasPrefix(name, ".tp-tmp-") || strings.HasPrefix(name, ".tp-meta-") || strings.HasPrefix(name, ".tp-export-")) {
 			return nil
 		}
-		if absStore != "" && !sameWorkStore && isPathWithinDir(absStore, path) {
+		if realStore != "" && !sameWorkStore && isPathWithinDir(realStore, path) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -256,7 +261,7 @@ func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, 
 				return nil
 			}
 		}
-		if d.Type()&os.ModeSymlink != 0 {
+		if checkpoint.IsLinkMode(d.Type()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -266,7 +271,7 @@ func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, 
 			return nil
 		}
 
-		rel, err := filepath.Rel(absWork, path)
+		rel, err := filepath.Rel(realWork, path)
 		if err != nil {
 			return nil
 		}

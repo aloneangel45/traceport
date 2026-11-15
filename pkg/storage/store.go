@@ -771,11 +771,18 @@ func writeAtomicFile(dest string, data []byte, perm os.FileMode) error {
 		return err
 	}
 
-	if err := os.Rename(tmpName, dest); err != nil {
-		_ = os.Chmod(dest, 0600)
-		if retryErr := os.Rename(tmpName, dest); retryErr != nil {
-			return retryErr
+	var renameErr error
+	for attempt := 0; attempt <= 5; attempt++ {
+		if attempt > 0 {
+			_ = os.Chmod(dest, 0600)
+			time.Sleep(25 * time.Millisecond)
 		}
+		if renameErr = os.Rename(tmpName, dest); renameErr == nil {
+			break
+		}
+	}
+	if renameErr != nil {
+		return renameErr
 	}
 	if runtime.GOOS != "windows" {
 		_ = os.Chmod(dest, perm)

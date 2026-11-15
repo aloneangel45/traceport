@@ -421,7 +421,10 @@ func ReadChunked(r *bufio.Reader) (string, error) {
 		b.ResetTimer()
 		var compLen int
 		for i := 0; i < b.N; i++ {
-			enc := c.Compress(sample)
+			enc, err := c.Compress(sample)
+			if err != nil {
+				b.Fatal(err)
+			}
 			compLen = len(enc)
 		}
 		b.ReportMetric(float64(compLen)*100.0/float64(len(sample)), "ratio_pct")
@@ -437,7 +440,10 @@ func ReadChunked(r *bufio.Reader) (string, error) {
 		b.ResetTimer()
 		var compLen int
 		for i := 0; i < b.N; i++ {
-			enc := c.Compress(sample)
+			enc, err := c.Compress(sample)
+			if err != nil {
+				b.Fatal(err)
+			}
 			compLen = len(enc)
 		}
 		b.ReportMetric(float64(compLen)*100.0/float64(len(sample)), "ratio_pct")
@@ -448,6 +454,14 @@ func BenchmarkIncrementalStatCache_Unchanged(b *testing.B) {
 	workDir := b.TempDir()
 	storeDir := b.TempDir()
 	populateBenchmarkWorkspace(b, workDir)
+
+	past := time.Now().Add(-10 * time.Second)
+	_ = filepath.WalkDir(workDir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			_ = os.Chtimes(p, past, past)
+		}
+		return nil
+	})
 
 	ts, err := NewTreeStore(workDir, storeDir)
 	if err != nil {

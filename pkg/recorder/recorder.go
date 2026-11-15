@@ -39,11 +39,16 @@ func nextUniqueSessionID() string {
 // DefaultCheckpointInterval is the debounce interval for intermediate shadow-tree snapshots.
 const DefaultCheckpointInterval = 40 * time.Millisecond
 
+// DefaultWaitDelay bounds how long Runner.Record waits for inherited stdout/stderr pipes
+// to close after the direct child process exits.
+const DefaultWaitDelay = 3 * time.Second
+
 // Runner wraps child agent/CLI processes, capturing telemetry frames and Zstd shadow-tree savepoints.
 type Runner struct {
 	store              *storage.Store
 	workspaceDir       string
 	checkpointInterval time.Duration
+	waitDelay          time.Duration
 	Tags               []string
 	Stdin              io.Reader
 	Stdout             io.Writer
@@ -60,6 +65,7 @@ func NewRunner(store *storage.Store, workspaceDir string) *Runner {
 		store:              store,
 		workspaceDir:       absWork,
 		checkpointInterval: DefaultCheckpointInterval,
+		waitDelay:          DefaultWaitDelay,
 		Stdin:              os.Stdin,
 		Stdout:             os.Stdout,
 		Stderr:             os.Stderr,
@@ -153,18 +159,22 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = r.workspaceDir
+	cmd.WaitDelay = 3 * time.Second
+	if r.waitDelay > 0 {
+		cmd.WaitDelay = r.waitDelay
+	}
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
+	stdoutPR, stdoutPW := io.Pipe()
+	stderrPR, stderrPW := io.Pipe()
 	cmd.Stdin = r.Stdin
+	cmd.Stdout = stdoutPW
+	cmd.Stderr = stderrPW
 
 	if err := cmd.Start(); err != nil {
+		_ = stdoutPW.Close()
+		_ = stderrPW.Close()
+		_ = stdoutPR.Close()
+		_ = stderrPR.Close()
 		session.EndTime = time.Now()
 		session.Status = "aborted"
 		session.ExitCode = 1
@@ -236,7 +246,7 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 
 	go func() {
 		defer wg.Done()
-		streamPipeLines(io.TeeReader(stdoutPipe, stdoutMirror), func(line string) {
+		streamPipeLines(io.TeeReader(stdoutPR, stdoutMirror), func(line string) {
 			captureCheckpoint("Intermediate workspace snapshot", false)
 			_ = r.store.AppendFrame(sessionID, model.Frame{
 				Timestamp: time.Now(),
@@ -248,7 +258,7 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 
 	go func() {
 		defer wg.Done()
-		streamPipeLines(io.TeeReader(stderrPipe, stderrMirror), func(line string) {
+		streamPipeLines(io.TeeReader(stderrPR, stderrMirror), func(line string) {
 			captureCheckpoint("Intermediate workspace snapshot", false)
 			_ = r.store.AppendFrame(sessionID, model.Frame{
 				Timestamp: time.Now(),
@@ -258,12 +268,20 @@ func (r *Runner) Record(command string, args []string) (*model.Session, error) {
 		})
 	}()
 
-	wg.Wait()
 	cmdErr := cmd.Wait()
+	_ = stdoutPW.Close()
+	_ = stderrPW.Close()
+	wg.Wait()
 
 	signal.Stop(sigCh)
 	close(doneCh)
 	<-watcherDone
+
+	// If the direct child exited cleanly (exit code 0) and cmd.WaitDelay closed an inherited
+	// grandchild pipe after timeout, do not treat ErrWaitDelay as a command failure.
+	if errors.Is(cmdErr, exec.ErrWaitDelay) && !interrupted.Load() {
+		cmdErr = nil
+	}
 
 	// Final post-execution workspace snapshot if any files mutated since the last checkpoint.
 	captureCheckpoint("Final workspace snapshot", true)

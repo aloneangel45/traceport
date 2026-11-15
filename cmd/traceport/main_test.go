@@ -361,8 +361,8 @@ func TestCLI_TagsExportRedactAndSearch(t *testing.T) {
 }
 
 func TestCLI_FlagReorderingDoubleDashAndPositionalValidation(t *testing.T) {
-	if Version != "1.2.1" || displayVersion() != "v1.2.1" {
-		t.Fatalf("expected default Version=1.2.1 / v1.2.1, got Version=%q display=%q", Version, displayVersion())
+	if Version != "1.2.2" || displayVersion() != "v1.2.2" {
+		t.Fatalf("expected default Version=1.2.2 / v1.2.2, got Version=%q display=%q", Version, displayVersion())
 	}
 
 	t.Setenv("TRACEPORT_CLI_HELPER", "1")

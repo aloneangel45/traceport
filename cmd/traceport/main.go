@@ -22,12 +22,12 @@ import (
 )
 
 // Version is injected at link time via -ldflags "-X main.Version=...".
-var Version = "1.2.1"
+var Version = "1.2.2"
 
 func displayVersion() string {
 	v := strings.TrimSpace(Version)
 	if v == "" {
-		return "v1.2.1"
+		return "v1.2.2"
 	}
 	if strings.HasPrefix(v, "v") {
 		return v
@@ -659,11 +659,18 @@ func writeAtomicCLIFile(dest string, data []byte, perm os.FileMode) error {
 		return err
 	}
 
-	if err := os.Rename(tmpName, absDest); err != nil {
-		_ = os.Chmod(absDest, 0600)
-		if retryErr := os.Rename(tmpName, absDest); retryErr != nil {
-			return retryErr
+	var renameErr error
+	for attempt := 0; attempt <= 5; attempt++ {
+		if attempt > 0 {
+			_ = os.Chmod(absDest, 0600)
+			time.Sleep(25 * time.Millisecond)
 		}
+		if renameErr = os.Rename(tmpName, absDest); renameErr == nil {
+			break
+		}
+	}
+	if renameErr != nil {
+		return renameErr
 	}
 	if runtime.GOOS != "windows" {
 		_ = os.Chmod(absDest, perm)

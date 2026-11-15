@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,7 +35,10 @@ func TestCompressor_RoundTripAndAutoFallback(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			encoded := comp.Compress(tc.data)
+			encoded, err := comp.Compress(tc.data)
+			if err != nil {
+				t.Fatalf("Compress failed: %v", err)
+			}
 			if !IsZstdFrame(encoded) {
 				t.Fatalf("expected RFC 8878 zstd magic header, got %x", encoded)
 			}
@@ -94,7 +98,11 @@ func TestCompressor_ConcurrentSafety(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 40; i++ {
 				payload := []byte(fmt.Sprintf("package worker_%d\nfunc Run() int { return %d }\n", id, i))
-				enc := comp.Compress(payload)
+				enc, err := comp.Compress(payload)
+				if err != nil {
+					errCh <- err
+					return
+				}
 				dec, err := comp.DecompressAuto(enc)
 				if err != nil {
 					errCh <- err
@@ -162,8 +170,14 @@ func Middleware(next http.Handler) http.Handler {
 }
 `)
 
-	rawEnc := rawComp.Compress(smallGo)
-	dictEnc := dictComp.Compress(smallGo)
+	rawEnc, err := rawComp.Compress(smallGo)
+	if err != nil {
+		t.Fatalf("raw Compress: %v", err)
+	}
+	dictEnc, err := dictComp.Compress(smallGo)
+	if err != nil {
+		t.Fatalf("dict Compress: %v", err)
+	}
 	if len(dictEnc) >= len(rawEnc) {
 		t.Fatalf("expected dictionary compression (%dB) to beat raw zstd (%dB) on small Go file", len(dictEnc), len(rawEnc))
 	}
@@ -248,10 +262,12 @@ func TestTreeStore_IncrementalCacheAndDeltaRollback(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(workDir, ".traceport"), 0755)
 	_ = os.WriteFile(filepath.Join(workDir, ".traceport", "keep.meta"), []byte("keep"), 0644)
 
+	pastBaseline := time.Now().Add(-10 * time.Second)
 	for i := 0; i < 10; i++ {
 		p := filepath.Join(workDir, "src", fmt.Sprintf("file_%02d.go", i))
 		_ = os.MkdirAll(filepath.Dir(p), 0755)
 		_ = os.WriteFile(p, []byte(fmt.Sprintf("package src\nconst V%d = %d\n", i, i)), 0644)
+		_ = os.Chtimes(p, pastBaseline, pastBaseline)
 	}
 
 	ts, err := NewTreeStore(workDir, storeDir)
@@ -373,7 +389,10 @@ func TestTreeStore_IntegrityVerificationAndTamperDetection(t *testing.T) {
 	blobSHA := manifest.Files[0].SHA256
 
 	// Tamper with blob content on disk (valid zstd of DIFFERENT content).
-	tampered := ts.compressor.Compress([]byte("package main\nfunc main() { panic(\"pwned\") }\n"))
+	tampered, err := ts.compressor.Compress([]byte("package main\nfunc main() { panic(\"pwned\") }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(ts.blobPath(blobSHA), tampered, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -431,13 +450,17 @@ func TestTreeStore_AdversarialPathAndSymlinkProtection(t *testing.T) {
 	rawJSON, _ := json.Marshal(malicious)
 	sum := sha256.Sum256(rawJSON)
 	badHash := hex.EncodeToString(sum[:])
-	_ = os.WriteFile(ts.manifestPath(badHash), ts.compressor.Compress(rawJSON), 0600)
+	malManifestEnc, err := ts.compressor.Compress(rawJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(ts.manifestPath(badHash), malManifestEnc, 0600)
 
 	if err := ts.RestoreSnapshot(badHash); err == nil {
 		t.Fatalf("expected RestoreSnapshot to reject malicious manifest path traversal")
 	}
 
-	// Test symlink directory escape prevention if OS permits symlinks.
+	// Test symlink directory escape prevention and safe unlink-before-restore rewind.
 	outsideDir := t.TempDir()
 	secretFile := filepath.Join(outsideDir, "secret.txt")
 	_ = os.WriteFile(secretFile, []byte("original-outside-secret"), 0644)
@@ -449,18 +472,34 @@ func TestTreeStore_AdversarialPathAndSymlinkProtection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Replace workDir/sub with a symlink to outsideDir and attempt RestoreSnapshot.
+	// Replace workDir/sub with a symlink/junction to outsideDir:
+	// 1) safeTargetPathLocked MUST refuse direct traversal through symlink directory.
+	// 2) RestoreSnapshot MUST safely unlink colliding symlink workDir/sub first, leaving
+	//    outsideDir/secret.txt untouched while restoring real workDir/sub/secret.txt!
 	_ = os.RemoveAll(filepath.Join(workDir, "sub"))
-	if symErr := os.Symlink(outsideDir, filepath.Join(workDir, "sub")); symErr == nil {
-		if err := ts.RestoreSnapshot(goodHash); err == nil {
-			t.Fatalf("expected RestoreSnapshot to block directory symlink escape")
+	if createDirLink(t, outsideDir, filepath.Join(workDir, "sub")) {
+		ts.mu.Lock()
+		_, travErr := ts.safeTargetPathLocked("sub/secret.txt", true)
+		ts.mu.Unlock()
+		if travErr == nil {
+			t.Fatalf("expected safeTargetPathLocked to block symlink directory traversal")
+		}
+
+		if err := ts.RestoreSnapshot(goodHash); err != nil {
+			t.Fatalf("RestoreSnapshot failed to unlink colliding directory symlink cleanly: %v", err)
 		}
 		outsideBytes, _ := os.ReadFile(secretFile)
 		if string(outsideBytes) != "original-outside-secret" {
 			t.Fatalf("SECURITY FAILURE: RestoreSnapshot overwrote file outside workspace via symlink!")
 		}
-	} else if runtime.GOOS != "windows" {
-		t.Fatalf("unexpected symlink creation failure: %v", symErr)
+		linfo, err := os.Lstat(filepath.Join(workDir, "sub"))
+		if err != nil || !linfo.IsDir() || IsLinkMode(linfo.Mode()) {
+			t.Fatalf("expected workDir/sub restored as real directory, got info=%v err=%v", linfo, err)
+		}
+		restoredBytes, err := os.ReadFile(filepath.Join(workDir, "sub", "secret.txt"))
+		if err != nil || string(restoredBytes) != "workspace-copy" {
+			t.Fatalf("expected workDir/sub/secret.txt restored to 'workspace-copy', got %q (err=%v)", string(restoredBytes), err)
+		}
 	}
 }
 
@@ -648,7 +687,7 @@ func TestTreeStore_CrossWorkspaceStatCacheIsolation(t *testing.T) {
 		t.Fatalf("test setup requires equal file sizes")
 	}
 
-	fixedTime := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+	fixedTime := time.Date(2025, 11, 14, 10, 0, 0, 0, time.UTC)
 	fileA := filepath.Join(workA, "main.go")
 	fileB := filepath.Join(workB, "main.go")
 
@@ -760,5 +799,369 @@ func TestTreeStore_ManifestDigestMismatchAndCrossOSWindowsDriveValidation(t *tes
 	}
 	if err := tsFresh.RestoreSnapshot(snap1); err == nil {
 		t.Fatalf("expected RestoreSnapshot to reject swapped manifest with mismatched SHA-256 digest")
+	}
+}
+
+func createDirLink(t *testing.T, targetDir, linkPath string) bool {
+	t.Helper()
+	if err := os.Symlink(targetDir, linkPath); err == nil {
+		return true
+	} else if runtime.GOOS == "windows" {
+		if out, jErr := exec.Command("cmd.exe", "/c", "mklink", "/J", linkPath, targetDir).CombinedOutput(); jErr == nil {
+			return true
+		} else {
+			t.Logf("skipping dir link creation on unprivileged Windows: symlink=%v junction=%v (%s)", err, jErr, string(out))
+			return false
+		}
+	} else {
+		t.Fatalf("unexpected directory symlink failure: %v", err)
+		return false
+	}
+}
+
+func TestCompressor_UseAfterCloseReturnsError(t *testing.T) {
+	comp, err := NewCompressor(WithEncoderDictionary(DefaultSourceDict()))
+	if err != nil {
+		t.Fatalf("NewCompressor: %v", err)
+	}
+	sample := []byte("package main\nfunc main() {}\n")
+	validFrame, err := comp.Compress(sample)
+	if err != nil {
+		t.Fatalf("Compress before Close: %v", err)
+	}
+
+	if err := comp.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+	if err := comp.Close(); err != nil {
+		t.Fatalf("Close #2 (idempotent): %v", err)
+	}
+
+	if _, err := comp.Compress(sample); !errors.Is(err, ErrCompressorClosed) {
+		t.Fatalf("expected ErrCompressorClosed from Compress after Close, got: %v", err)
+	}
+	if _, err := comp.Decompress(validFrame); !errors.Is(err, ErrCompressorClosed) {
+		t.Fatalf("expected ErrCompressorClosed from Decompress after Close, got: %v", err)
+	}
+	if _, err := comp.DecompressAuto(validFrame); !errors.Is(err, ErrCompressorClosed) {
+		t.Fatalf("expected ErrCompressorClosed from DecompressAuto(zstd) after Close, got: %v", err)
+	}
+	if _, err := comp.DecompressAuto([]byte("raw non-zstd")); !errors.Is(err, ErrCompressorClosed) {
+		t.Fatalf("expected ErrCompressorClosed from DecompressAuto(raw) after Close, got: %v", err)
+	}
+
+	var nilComp *Compressor
+	if _, err := nilComp.Compress(sample); !errors.Is(err, ErrCompressorClosed) {
+		t.Fatalf("expected ErrCompressorClosed on nil Compressor.Compress, got: %v", err)
+	}
+}
+
+func TestTreeStore_UncompressedModePreservesRealZstUserFiles(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+
+	// Create a genuine Zstandard-compressed user file (.zst) inside the workspace.
+	helperComp, err := NewCompressor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer helperComp.Close()
+
+	innerPlain := []byte("inner payload inside user archive.tar.zst that MUST NOT be decompressed by TreeStore!\n")
+	realZstBytes, err := helperComp.Compress(innerPlain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsZstdFrame(realZstBytes) {
+		t.Fatalf("expected realZstBytes to begin with RFC 8878 Zstd magic header")
+	}
+
+	userZstPath := filepath.Join(workDir, "fixtures", "archive.tar.zst")
+	if err := os.MkdirAll(filepath.Dir(userZstPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userZstPath, realZstBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ts, err := NewTreeStore(workDir, storeDir, WithCompressionMode(ModeUncompressed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+
+	treeHash, err := ts.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("CreateSnapshot (ModeUncompressed): %v", err)
+	}
+
+	manifest, err := ts.LoadManifest(treeHash)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if len(manifest.Files) != 1 || manifest.Files[0].Size != int64(len(realZstBytes)) {
+		t.Fatalf("unexpected manifest entry: %+v", manifest.Files)
+	}
+
+	blobBytes, err := ts.ReadBlob(manifest.Files[0].SHA256)
+	if err != nil {
+		t.Fatalf("ReadBlob on uncompressed .zst user file failed: %v", err)
+	}
+	if !bytes.Equal(blobBytes, realZstBytes) {
+		t.Fatalf("ReadBlob corrupted .zst user file (got %dB, want %dB)", len(blobBytes), len(realZstBytes))
+	}
+
+	if vRes, err := ts.VerifyTree(treeHash); err != nil || vRes.FilesVerified != 1 {
+		t.Fatalf("VerifyTree failed on uncompressed .zst user file: res=%+v err=%v", vRes, err)
+	}
+
+	// Delete workspace file and restore from ModeUncompressed store; verify exact .zst bytes!
+	if err := os.Remove(userZstPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.RestoreSnapshot(treeHash); err != nil {
+		t.Fatalf("RestoreSnapshot failed: %v", err)
+	}
+	restored, err := os.ReadFile(userZstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, realZstBytes) {
+		t.Fatalf("restored .zst user file mismatch: got %dB, want %dB", len(restored), len(realZstBytes))
+	}
+}
+
+func TestTreeStore_SymlinkedWorkspaceRootAndDictTraining(t *testing.T) {
+	realWork := filepath.Join(t.TempDir(), "real_workspace")
+	if err := os.MkdirAll(filepath.Join(realWork, "cmd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		p := filepath.Join(realWork, "cmd", fmt.Sprintf("mod_%d.go", i))
+		content := fmt.Sprintf("package cmd\nfunc Step%d() int { return %d }\n", i, i)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	linkedWork := filepath.Join(t.TempDir(), "linked_workspace")
+	if !createDirLink(t, realWork, linkedWork) {
+		t.Skip("directory symlink/junction unavailable")
+	}
+
+	storeDir := t.TempDir()
+
+	// 1. Dictionary training via symlinked workspace root must sample all 6 source files (not 0!).
+	dStats, err := TrainDictionaryFromDir(linkedWork, storeDir)
+	if err != nil {
+		t.Fatalf("TrainDictionaryFromDir on symlinked workspace failed: %v", err)
+	}
+	if dStats.SampleCount != 6 {
+		t.Fatalf("expected 6 sampled files via symlinked workspace root, got %d", dStats.SampleCount)
+	}
+
+	// 2. TreeStore CreateSnapshot & RestoreSnapshot via symlinked workspace root must index all 6 files.
+	ts, err := NewTreeStore(linkedWork, storeDir)
+	if err != nil {
+		t.Fatalf("NewTreeStore(linkedWork): %v", err)
+	}
+	defer ts.Close()
+
+	snap1, stats1, err := ts.CreateSnapshotWithStats()
+	if err != nil {
+		t.Fatalf("CreateSnapshot via symlinked workspace failed: %v", err)
+	}
+	if stats1.FilesIndexed != 6 {
+		t.Fatalf("expected 6 indexed files via symlinked workspace root, got %d", stats1.FilesIndexed)
+	}
+
+	// Mutate 1 file and add 1 stray file through linkedWork, then rewind to snap1.
+	targetMod := filepath.Join(linkedWork, "cmd", "mod_0.go")
+	strayFile := filepath.Join(linkedWork, "stray.txt")
+	_ = os.WriteFile(targetMod, []byte("package cmd\nBROKEN\n"), 0644)
+	_ = os.WriteFile(strayFile, []byte("delete me"), 0644)
+
+	rStats, err := ts.RestoreSnapshotWithStats(snap1)
+	if err != nil {
+		t.Fatalf("RestoreSnapshotWithStats via symlinked workspace failed: %v", err)
+	}
+	if rStats.FilesRestored != 1 || rStats.FilesDeleted != 1 || rStats.FilesSkipped != 5 {
+		t.Fatalf("unexpected restore stats via symlinked workspace: %+v", rStats)
+	}
+	got, err := os.ReadFile(targetMod)
+	if err != nil || string(got) != "package cmd\nfunc Step0() int { return 0 }\n" {
+		t.Fatalf("mod_0.go not restored via symlinked workspace: %q (err=%v)", string(got), err)
+	}
+}
+
+func TestTreeStore_PreservesPreExistingSymlinksAndUnlinksCollidingSymlinks(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+	externalSafeDir := t.TempDir()
+	externalAttackDir := t.TempDir()
+
+	_ = os.WriteFile(filepath.Join(externalSafeDir, "keep.txt"), []byte("external-safe"), 0644)
+	_ = os.WriteFile(filepath.Join(externalAttackDir, "api.go"), []byte("external-do-not-touch"), 0644)
+
+	// Seed tracked regular files.
+	_ = os.MkdirAll(filepath.Join(workDir, "src"), 0755)
+	_ = os.WriteFile(filepath.Join(workDir, "src", "main.go"), []byte("package main\n"), 0644)
+	_ = os.MkdirAll(filepath.Join(workDir, "pkg"), 0755)
+	_ = os.WriteFile(filepath.Join(workDir, "pkg", "api.go"), []byte("package pkg\nfunc OK() {}\n"), 0644)
+	_ = os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Clean Readme\n"), 0644)
+
+	// Seed pre-existing non-colliding workspace symlinks (at root and inside tracked dir src/).
+	rootLink := filepath.Join(workDir, "vendor_link")
+	srcLink := filepath.Join(workDir, "src", "docs_link")
+	if !createDirLink(t, externalSafeDir, rootLink) || !createDirLink(t, externalSafeDir, srcLink) {
+		t.Skip("directory symlink/junction unavailable")
+	}
+
+	ts, err := NewTreeStore(workDir, storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+
+	snap, err := ts.CreateSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate post-checkpoint agent havoc:
+	// 1. Replace tracked directory pkg/ with a symlink pkg -> externalAttackDir.
+	_ = os.RemoveAll(filepath.Join(workDir, "pkg"))
+	if !createDirLink(t, externalAttackDir, filepath.Join(workDir, "pkg")) {
+		t.Fatal("failed creating colliding pkg symlink")
+	}
+
+	// 2. Replace tracked file README.md with a symlink README.md -> externalAttackDir.
+	_ = os.Remove(filepath.Join(workDir, "README.md"))
+	if !createDirLink(t, externalAttackDir, filepath.Join(workDir, "README.md")) {
+		t.Fatal("failed creating colliding README.md symlink")
+	}
+
+	// 3. Create a brand-new post-checkpoint directory containing a symlink.
+	newAgentDir := filepath.Join(workDir, "new_agent_dir")
+	_ = os.MkdirAll(newAgentDir, 0755)
+	if !createDirLink(t, externalAttackDir, filepath.Join(newAgentDir, "nested_link")) {
+		t.Fatal("failed creating symlink inside new_agent_dir")
+	}
+
+	plan, err := ts.PlanRestore(snap)
+	if err != nil {
+		t.Fatalf("PlanRestore failed: %v", err)
+	}
+	for _, delPath := range plan.Delete {
+		if delPath == "vendor_link" || delPath == "src/docs_link" {
+			t.Fatalf("PlanRestore wrongly scheduled pre-existing symlink %q for deletion!", delPath)
+		}
+	}
+
+	if _, err := ts.RestoreSnapshotWithStats(snap); err != nil {
+		t.Fatalf("RestoreSnapshotWithStats failed: %v", err)
+	}
+
+	// Verify pre-existing non-colliding symlinks were preserved!
+	if info, err := os.Lstat(rootLink); err != nil || !IsLinkMode(info.Mode()) {
+		t.Fatalf("expected pre-existing root symlink vendor_link to be preserved, got info=%v err=%v", info, err)
+	}
+	if info, err := os.Lstat(srcLink); err != nil || !IsLinkMode(info.Mode()) {
+		t.Fatalf("expected pre-existing src/docs_link symlink to be preserved, got info=%v err=%v", info, err)
+	}
+
+	// Verify colliding pkg symlink was unlinked and real pkg/api.go restored without touching externalAttackDir!
+	pkgInfo, err := os.Lstat(filepath.Join(workDir, "pkg"))
+	if err != nil || !pkgInfo.IsDir() || IsLinkMode(pkgInfo.Mode()) {
+		t.Fatalf("expected pkg restored as real directory, got info=%v err=%v", pkgInfo, err)
+	}
+	apiBytes, err := os.ReadFile(filepath.Join(workDir, "pkg", "api.go"))
+	if err != nil || string(apiBytes) != "package pkg\nfunc OK() {}\n" {
+		t.Fatalf("expected pkg/api.go restored, got %q (err=%v)", string(apiBytes), err)
+	}
+	extApiBytes, _ := os.ReadFile(filepath.Join(externalAttackDir, "api.go"))
+	if string(extApiBytes) != "external-do-not-touch" {
+		t.Fatalf("SECURITY FAILURE: external target mutated during rewind!")
+	}
+
+	// Verify colliding README.md symlink was replaced with real regular file!
+	readmeInfo, err := os.Lstat(filepath.Join(workDir, "README.md"))
+	if err != nil || !readmeInfo.Mode().IsRegular() {
+		t.Fatalf("expected README.md restored as regular file, got info=%v err=%v", readmeInfo, err)
+	}
+
+	// Verify symlink inside newly created directory + new_agent_dir itself were removed!
+	if _, err := os.Lstat(newAgentDir); !os.IsNotExist(err) {
+		t.Fatalf("expected newly created directory new_agent_dir and its symlink to be pruned, err=%v", err)
+	}
+}
+
+func TestTreeStore_StatCacheRacyCleanAndPostRestoreOverwrite(t *testing.T) {
+	workDir := t.TempDir()
+	storeDir := t.TempDir()
+
+	target := filepath.Join(workDir, "config.env")
+	v1 := []byte("TOKEN=alpha_111\n") // 16 bytes
+	v2 := []byte("TOKEN=bravo_222\n") // 16 bytes (identical size!)
+	v3 := []byte("TOKEN=gamma_333\n") // 16 bytes (identical size!)
+
+	if err := os.WriteFile(target, v1, 0644); err != nil {
+		t.Fatal(err)
+	}
+	info1, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts, err := NewTreeStore(workDir, storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+
+	snap1, _, err := ts.CreateSnapshotWithStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Immediate (<40ms) same-size overwrite with identical mtime inside the 2s racy-clean window!
+	if err := os.WriteFile(target, v2, 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(target, info1.ModTime(), info1.ModTime())
+
+	snap2, stats2, err := ts.CreateSnapshotWithStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap2 == snap1 {
+		t.Fatalf("racy-clean bug: same-size sub-tick overwrite recorded stale snapshot hash %s!", snap2)
+	}
+	if stats2.CacheMisses != 1 {
+		t.Fatalf("expected racy-clean window to bypass statCache hit, got %+v", stats2)
+	}
+
+	// 2. Restore snap1, then immediately perform a same-size edit with identical mtime!
+	if err := ts.RestoreSnapshot(snap1); err != nil {
+		t.Fatal(err)
+	}
+	restoredInfo, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, v3, 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(target, restoredInfo.ModTime(), restoredInfo.ModTime())
+
+	snap3, stats3, err := ts.CreateSnapshotWithStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap3 == snap1 || snap3 == snap2 {
+		t.Fatalf("post-restore racy-clean bug: immediate same-size edit produced stale hash %s", snap3)
+	}
+	if stats3.CacheMisses != 1 {
+		t.Fatalf("expected post-restore racy-clean edit to re-hash file, got %+v", stats3)
 	}
 }

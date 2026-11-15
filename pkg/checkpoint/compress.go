@@ -2,11 +2,15 @@ package checkpoint
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
+
+// ErrCompressorClosed is returned when Compress, Decompress, or DecompressAuto is invoked after Close.
+var ErrCompressorClosed = errors.New("zstd compressor is closed")
 
 // ZstdMagic is the 4-byte little-endian magic header defined in RFC 8878 (0xFD2FB528).
 var ZstdMagic = [4]byte{0x28, 0xB5, 0x2F, 0xFD}
@@ -185,24 +189,37 @@ func (c *Compressor) rebuildCodecsLocked() error {
 }
 
 // Compress encodes src into a complete Zstandard frame (including empty slices via ZeroFrames).
-func (c *Compressor) Compress(src []byte) []byte {
+func (c *Compressor) Compress(src []byte) ([]byte, error) {
+	if c == nil {
+		return nil, ErrCompressorClosed
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.enc == nil {
+		return nil, ErrCompressorClosed
+	}
 
 	dstCap := len(src)/2 + 32
 	if dstCap < 32 {
 		dstCap = 32
 	}
-	return c.enc.EncodeAll(src, make([]byte, 0, dstCap))
+	return c.enc.EncodeAll(src, make([]byte, 0, dstCap)), nil
 }
 
-// Decompress decodes a Zstandard frame strictly, returning an error if src is not valid Zstd.
+// Decompress decodes a Zstandard frame strictly, returning an error if src is not valid Zstd
+// or if the compressor has been closed.
 func (c *Compressor) Decompress(src []byte) ([]byte, error) {
-	if !IsZstdFrame(src) {
-		return nil, fmt.Errorf("missing zstd RFC 8878 magic header")
+	if c == nil {
+		return nil, ErrCompressorClosed
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.dec == nil {
+		return nil, ErrCompressorClosed
+	}
+	if !IsZstdFrame(src) {
+		return nil, fmt.Errorf("missing zstd RFC 8878 magic header")
+	}
 
 	out, err := c.dec.DecodeAll(src, nil)
 	if err != nil {
@@ -217,11 +234,26 @@ func (c *Compressor) Decompress(src []byte) ([]byte, error) {
 // DecompressAuto inspects the first 4 bytes for RFC 8878 magic bytes (0x28 0xB5 0x2F 0xFD).
 // Zstandard frames are decoded via DecodeAll; legacy/uncompressed payloads are returned as-is.
 func (c *Compressor) DecompressAuto(src []byte) ([]byte, error) {
+	if c == nil {
+		return nil, ErrCompressorClosed
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.dec == nil {
+		return nil, ErrCompressorClosed
+	}
 	if len(src) == 0 {
 		return []byte{}, nil
 	}
 	if IsZstdFrame(src) {
-		return c.Decompress(src)
+		out, err := c.dec.DecodeAll(src, nil)
+		if err != nil {
+			return nil, fmt.Errorf("zstd decode failed: %w", err)
+		}
+		if out == nil {
+			return []byte{}, nil
+		}
+		return out, nil
 	}
 	out := make([]byte, len(src))
 	copy(out, src)

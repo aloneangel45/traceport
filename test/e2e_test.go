@@ -329,7 +329,7 @@ func TestInstallerPS1_RestrictedPSModulePathEndToEnd(t *testing.T) {
 	}
 
 	verOut, err := exec.Command(destExe, "version").CombinedOutput()
-	if err != nil || strings.TrimSpace(string(verOut)) != "traceport v1.2.1" {
+	if err != nil || strings.TrimSpace(string(verOut)) != "traceport v1.2.2" {
 		t.Fatalf("installed traceport.exe version check failed: err=%v out=%q", err, string(verOut))
 	}
 
@@ -339,5 +339,105 @@ func TestInstallerPS1_RestrictedPSModulePathEndToEnd(t *testing.T) {
 	if badErr == nil || !strings.Contains(badOut, "SHA-256 checksum mismatch") {
 		t.Fatalf("expected SHA-256 mismatch error from install.ps1, got err=%v\n%s", badErr, badOut)
 	}
+
+	// 3. Verify Desktop (5.1) PSModulePath strips PowerShell\7 entries, prepends $PSHome\Modules,
+	//    and `irm | iex` style invocation throws cleanly without killing the caller shell via `exit`.
+	psIexCheck := fmt.Sprintf(
+		`$env:PSModulePath = 'C:\Program Files\PowerShell\7\Modules;C:\Custom\Modules'; `+
+			`$caught = $false; `+
+			`try { Invoke-Expression ([System.IO.File]::ReadAllText('%s')) } catch { $caught = $true }; `+
+			`Write-Output ("AFTER_IEX_ALIVE=" + $caught); `+
+			`Write-Output ("FINAL_PSMP=" + $env:PSModulePath)`,
+		strings.ReplaceAll(scriptPath, "'", "''"),
+	)
+	iexCmd := exec.Command(psExe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psIexCheck)
+	iexCmd.Env = append(os.Environ(),
+		"TRACEPORT_INSTALL_DIR="+installDir,
+		"TRACEPORT_RELEASE_BASE_URL="+srv.URL,
+		"TRACEPORT_SKIP_PATH_UPDATE=1",
+	)
+	iexOutBytes, iexErr := iexCmd.CombinedOutput()
+	iexOut := string(iexOutBytes)
+	if iexErr != nil {
+		t.Fatalf("caller shell exited unexpectedly during iex of install.ps1: %v\n%s", iexErr, iexOut)
+	}
+	if !strings.Contains(iexOut, "AFTER_IEX_ALIVE=True") {
+		t.Fatalf("expected iex failure to be catchable without terminating caller shell:\n%s", iexOut)
+	}
+	if strings.Contains(strings.ToLower(iexOut), `powershell\7`) {
+		t.Fatalf("expected PowerShell\\7 module path stripped in Desktop 5.1 edition:\n%s", iexOut)
+	}
+	if !strings.Contains(iexOut, `C:\Custom\Modules`) {
+		t.Fatalf("expected non-PS7 custom module path preserved:\n%s", iexOut)
+	}
 }
+
+func TestInstallerSHAndRepoConfigs_PureLFAndAtomicInstall(t *testing.T) {
+	lfFiles := []string{
+		"../install.sh",
+		"../.github/workflows/ci.yml",
+		"../.github/workflows/release.yml",
+	}
+	for _, rel := range lfFiles {
+		raw, err := os.ReadFile(rel)
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if bytes.Contains(raw, []byte{'\r'}) {
+			t.Fatalf("%s contains CR (\\r) bytes; must be pure LF (\\n)!", rel)
+		}
+	}
+
+	gitAttrBytes, err := os.ReadFile("../.gitattributes")
+	if err != nil {
+		t.Fatalf("read ../.gitattributes: %v", err)
+	}
+	for _, rule := range []string{
+		"* text=auto",
+		"*.sh text eol=lf",
+		"*.go text eol=lf",
+		"*.yml text eol=lf",
+		"*.yaml text eol=lf",
+		"*.ps1 text eol=crlf",
+	} {
+		if !strings.Contains(string(gitAttrBytes), rule) {
+			t.Fatalf(".gitattributes missing required rule %q", rule)
+		}
+	}
+
+	shBytes, _ := os.ReadFile("../install.sh")
+	sh := string(shBytes)
+	if strings.Count(sh, `mkdir -p "${INSTALL_DIR}"`) < 3 {
+		t.Fatalf("expected install.sh to run mkdir -p \"${INSTALL_DIR}\" across custom, root, and non-root branches")
+	}
+	if !strings.Contains(sh, `mv -f "${STAGED_BIN}" "${INSTALL_DIR}/${BINARY_NAME}"`) {
+		t.Fatalf("expected install.sh to install atomically via temp file + mv -f")
+	}
+
+	psBytes, err := os.ReadFile("../install.ps1")
+	if err != nil {
+		t.Fatalf("read ../install.ps1: %v", err)
+	}
+	for lineNo, line := range strings.Split(string(psBytes), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if trimmed == "exit" || strings.HasPrefix(trimmed, "exit ") {
+			t.Fatalf("install.ps1 line %d uses 'exit' (%q), which kills caller shells under irm | iex", lineNo+1, trimmed)
+		}
+	}
+
+	for _, wf := range []string{"../.github/workflows/ci.yml", "../.github/workflows/release.yml"} {
+		wfRaw, _ := os.ReadFile(wf)
+		if !strings.Contains(string(wfRaw), `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"`) {
+			t.Fatalf("expected %s to set FORCE_JAVASCRIPT_ACTIONS_TO_NODE24", wf)
+		}
+	}
+	ciRaw, _ := os.ReadFile("../.github/workflows/ci.yml")
+	if !strings.Contains(string(ciRaw), "contents: read") {
+		t.Fatalf("expected ci.yml to declare permissions: contents: read")
+	}
+}
+
 
