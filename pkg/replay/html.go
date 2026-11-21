@@ -7,22 +7,34 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/traceport/pkg/checkpoint"
 	"github.com/aloneangel45/traceport/pkg/model"
 	"github.com/aloneangel45/traceport/pkg/redact"
 )
 
+const (
+	maxHTMLFrameRunes        = 64 * 1024
+	maxHTMLToolRunes         = 32 * 1024
+	maxHTMLTotalContentRunes = 2 * 1024 * 1024
+	maxHTMLDiffBlobBytes     = 512 * 1024
+	maxHTMLFileDiffRunes     = 32 * 1024
+	maxHTMLDiffFilesPerStep  = 200
+	maxHTMLTotalDiffRunes    = 1 * 1024 * 1024
+)
+
 type htmlCheckpointDiff struct {
-	PrevStep    int
-	FromHash    string
-	ToHash      string
-	IsInitial   bool
-	InitialList []string
-	FilesAdded  int
-	FilesMod    int
-	FilesDel    int
-	Changes     []FileDiffEntry
+	PrevStep     int
+	FromHash     string
+	ToHash       string
+	IsInitial    bool
+	InitialList  []string
+	FilesAdded   int
+	FilesMod     int
+	FilesDel     int
+	OmittedFiles int
+	Changes      []FileDiffEntry
 }
 
 // renderHTMLTimelineReport builds a self-contained, zero-CDN, dark-mode interactive HTML
@@ -37,7 +49,7 @@ func (e *Engine) renderHTMLTimelineReport(session *model.Session) string {
 		clean = &model.Session{}
 	}
 
-	diffByStep := e.computeConsecutiveCheckpointDiffs(clean)
+	diffByIdx := e.computeConsecutiveCheckpointDiffs(clean)
 
 	counts := map[string]int{
 		"all":        len(clean.Frames),
@@ -85,6 +97,7 @@ func (e *Engine) renderHTMLTimelineReport(session *model.Session) string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
 <title>TracePort Timeline — `)
 	sb.WriteString(html.EscapeString(clean.ID))
 	sb.WriteString(`</title>
@@ -567,20 +580,22 @@ pre.code-error {
 				preview = "tool: " + f.Tool.Name
 			}
 			ts := f.Timestamp.UTC().Format("15:04:05.000")
+			safeTypeClass := sanitizeCSSClassToken(string(f.Type))
 
 			sb.WriteString(fmt.Sprintf(
-				"      <button type=\"button\" class=\"step-item%s\" data-step=\"%d\" data-type=\"%s\">\n",
+				"      <button type=\"button\" class=\"step-item%s\" data-step=\"%d\" data-panel-idx=\"%d\" data-type=\"%s\">\n",
 				activeCls,
 				stepNum,
+				idx,
 				html.EscapeString(filterGroup),
 			))
 			sb.WriteString("        <div class=\"step-row-top\">\n")
 			sb.WriteString(fmt.Sprintf("          <span><span class=\"step-num\">#%d</span> <span class=\"type-pill type-%s\">%s</span></span>\n",
-				stepNum, html.EscapeString(string(f.Type)), html.EscapeString(string(f.Type))))
+				stepNum, safeTypeClass, html.EscapeString(string(f.Type))))
 			sb.WriteString(fmt.Sprintf("          <span class=\"step-ts\">%s</span>\n", html.EscapeString(ts)))
 			sb.WriteString("        </div>\n")
 			sb.WriteString(fmt.Sprintf("        <div class=\"step-preview\">%s</div>\n", html.EscapeString(preview)))
-			if d, hasDiff := diffByStep[stepNum]; hasDiff {
+			if d, hasDiff := diffByIdx[idx]; hasDiff {
 				if d.IsInitial {
 					sb.WriteString(fmt.Sprintf("        <div class=\"step-diff-pills\"><span>initial: %d files</span></div>\n", len(d.InitialList)))
 				} else if d.FilesAdded+d.FilesMod+d.FilesDel > 0 {
@@ -601,6 +616,7 @@ pre.code-error {
 	if len(clean.Frames) == 0 {
 		sb.WriteString("    <div class=\"empty-state\">Select a recorded step to inspect output and diffs.</div>\n")
 	} else {
+		remainingContentBudget := maxHTMLTotalContentRunes
 		for idx, f := range clean.Frames {
 			stepNum := f.Index
 			if stepNum <= 0 {
@@ -610,13 +626,14 @@ pre.code-error {
 			if idx > 0 {
 				hiddenAttr = " hidden"
 			}
-			sb.WriteString(fmt.Sprintf("    <section class=\"step-panel\" data-step=\"%d\"%s>\n", stepNum, hiddenAttr))
+			safeTypeClass := sanitizeCSSClassToken(string(f.Type))
+			sb.WriteString(fmt.Sprintf("    <section class=\"step-panel\" data-step=\"%d\" data-panel-idx=\"%d\"%s>\n", stepNum, idx, hiddenAttr))
 			sb.WriteString("      <div class=\"panel-head\">\n")
 			sb.WriteString(fmt.Sprintf("        <div class=\"panel-title\"><span>Step #%d</span> <span class=\"type-pill type-%s\">%s</span></div>\n",
-				stepNum, html.EscapeString(string(f.Type)), html.EscapeString(string(f.Type))))
+				stepNum, safeTypeClass, html.EscapeString(string(f.Type))))
 			sb.WriteString(fmt.Sprintf("        <div class=\"panel-meta\">%s", html.EscapeString(f.Timestamp.UTC().Format(time.RFC3339Nano))))
 			if f.GitSnapshot != "" {
-				shortHash := f.GitSnapshot
+				shortHash := redact.String(f.GitSnapshot)
 				if len(shortHash) > 12 {
 					shortHash = shortHash[:12]
 				}
@@ -648,6 +665,8 @@ pre.code-error {
 			bodyText := f.Content
 			if bodyText == "" {
 				bodyText = "(empty)"
+			} else {
+				bodyText = capHTMLTextWithBudget(bodyText, maxHTMLFrameRunes, &remainingContentBudget)
 			}
 			sb.WriteString(fmt.Sprintf("        <pre class=\"%s\">%s</pre>\n", preClass, html.EscapeString(bodyText)))
 			sb.WriteString("      </div>\n")
@@ -662,18 +681,20 @@ pre.code-error {
 				sb.WriteString(fmt.Sprintf("        <div class=\"card-head\"><span>Tool Invocation: %s</span>%s</div>\n", html.EscapeString(f.Tool.Name), durMeta))
 				if len(f.Tool.Arguments) > 0 {
 					if rawArgs, err := json.MarshalIndent(f.Tool.Arguments, "", "  "); err == nil {
-						sb.WriteString(fmt.Sprintf("        <pre class=\"code-block\">%s</pre>\n", html.EscapeString(string(rawArgs))))
+						argText := capHTMLTextWithBudget(redact.String(string(rawArgs)), maxHTMLToolRunes, &remainingContentBudget)
+						sb.WriteString(fmt.Sprintf("        <pre class=\"code-block\">%s</pre>\n", html.EscapeString(argText)))
 					}
 				}
 				if strings.TrimSpace(f.Tool.Result) != "" {
+					resText := capHTMLTextWithBudget(f.Tool.Result, maxHTMLToolRunes, &remainingContentBudget)
 					sb.WriteString("        <div class=\"card-head\"><span>Tool Result</span></div>\n")
-					sb.WriteString(fmt.Sprintf("        <pre class=\"code-block\">%s</pre>\n", html.EscapeString(f.Tool.Result)))
+					sb.WriteString(fmt.Sprintf("        <pre class=\"code-block\">%s</pre>\n", html.EscapeString(resText)))
 				}
 				sb.WriteString("      </div>\n")
 			}
 
 			// Checkpoint unified diff card
-			if cpDiff, ok := diffByStep[stepNum]; ok {
+			if cpDiff, ok := diffByIdx[idx]; ok {
 				renderHTMLCheckpointDiffCard(&sb, cpDiff)
 			}
 
@@ -691,18 +712,22 @@ pre.code-error {
   var filterButtons = Array.prototype.slice.call(document.querySelectorAll(".filter-btn"));
   var stepItems = Array.prototype.slice.call(document.querySelectorAll(".step-item"));
   var stepPanels = Array.prototype.slice.call(document.querySelectorAll(".step-panel"));
+  var panelByIdx = {};
+  stepPanels.forEach(function (panel) {
+    panelByIdx[panel.getAttribute("data-panel-idx")] = panel;
+  });
   var searchInput = document.getElementById("tp-search");
 
-  function selectStep(stepNum) {
+  function selectPanel(panelIdx) {
     stepItems.forEach(function (btn) {
-      if (btn.getAttribute("data-step") === String(stepNum)) {
+      if (panelIdx !== null && btn.getAttribute("data-panel-idx") === String(panelIdx)) {
         btn.classList.add("active");
       } else {
         btn.classList.remove("active");
       }
     });
     stepPanels.forEach(function (panel) {
-      if (panel.getAttribute("data-step") === String(stepNum)) {
+      if (panelIdx !== null && panel.getAttribute("data-panel-idx") === String(panelIdx)) {
         panel.removeAttribute("hidden");
       } else {
         panel.setAttribute("hidden", "");
@@ -716,8 +741,13 @@ pre.code-error {
     stepItems.forEach(function (btn) {
       var kind = btn.getAttribute("data-type") || "";
       var matchesFilter = (activeFilter === "all") || (kind === activeFilter);
+      var panelIdx = btn.getAttribute("data-panel-idx");
       var text = (btn.textContent || "").toLowerCase();
       var matchesSearch = !searchQuery || text.indexOf(searchQuery) !== -1;
+      if (!matchesSearch && panelIdx !== null && panelByIdx[panelIdx]) {
+        var panelText = (panelByIdx[panelIdx].textContent || "").toLowerCase();
+        matchesSearch = panelText.indexOf(searchQuery) !== -1;
+      }
       if (matchesFilter && matchesSearch) {
         btn.removeAttribute("hidden");
         if (!firstVisible) { firstVisible = btn; }
@@ -726,8 +756,12 @@ pre.code-error {
         btn.setAttribute("hidden", "");
       }
     });
-    if (!activeStillVisible && firstVisible) {
-      selectStep(firstVisible.getAttribute("data-step"));
+    if (!activeStillVisible) {
+      if (firstVisible) {
+        selectPanel(firstVisible.getAttribute("data-panel-idx"));
+      } else {
+        selectPanel(null);
+      }
     }
   }
 
@@ -742,7 +776,7 @@ pre.code-error {
 
   stepItems.forEach(function (btn) {
     btn.addEventListener("click", function () {
-      selectStep(btn.getAttribute("data-step"));
+      selectPanel(btn.getAttribute("data-panel-idx"));
     });
   });
 
@@ -766,7 +800,7 @@ pre.code-error {
       curIdx = Math.max(0, curIdx - 1);
     }
     ev.preventDefault();
-    selectStep(visible[curIdx].getAttribute("data-step"));
+    selectPanel(visible[curIdx].getAttribute("data-panel-idx"));
     visible[curIdx].scrollIntoView({ block: "nearest" });
   });
 })();
@@ -793,6 +827,7 @@ func (e *Engine) computeConsecutiveCheckpointDiffs(session *model.Session) map[i
 	var prevStep int
 	var prevHash string
 	var prevManifest *checkpoint.TreeManifest
+	remainingDiffBudget := maxHTMLTotalDiffRunes
 
 	for idx, f := range session.Frames {
 		if f.GitSnapshot == "" || !treeStore.HasTree(f.GitSnapshot) {
@@ -813,14 +848,14 @@ func (e *Engine) computeConsecutiveCheckpointDiffs(session *model.Session) map[i
 				paths = append(paths, redact.String(fe.Path))
 			}
 			sort.Strings(paths)
-			out[stepNum] = htmlCheckpointDiff{
+			out[idx] = htmlCheckpointDiff{
 				ToHash:      f.GitSnapshot,
 				IsInitial:   true,
 				InitialList: paths,
 			}
 		} else {
-			diffEntry := computeManifestPairDiff(treeStore, prevStep, prevHash, f.GitSnapshot, prevManifest, curManifest)
-			out[stepNum] = diffEntry
+			diffEntry := computeManifestPairDiff(treeStore, prevStep, prevHash, f.GitSnapshot, prevManifest, curManifest, &remainingDiffBudget)
+			out[idx] = diffEntry
 		}
 
 		prevStep = stepNum
@@ -835,6 +870,7 @@ func computeManifestPairDiff(
 	prevStep int,
 	fromHash, toHash string,
 	fromManifest, toManifest *checkpoint.TreeManifest,
+	remainingDiffBudget *int,
 ) htmlCheckpointDiff {
 	res := htmlCheckpointDiff{
 		PrevStep: prevStep,
@@ -876,29 +912,71 @@ func computeManifestPairDiff(
 		safePath := redact.String(p)
 		switch {
 		case !inA && inB:
-			bBytes, err := treeStore.ReadBlob(b.SHA256)
-			if err != nil {
+			res.FilesAdded++
+			if len(res.Changes) >= maxHTMLDiffFilesPerStep {
+				res.OmittedFiles++
 				continue
 			}
-			u := redact.String(formatFileUnifiedDiff("/dev/null", "b/"+safePath, nil, bBytes))
-			res.FilesAdded++
+			var u string
+			if b.Size > maxHTMLDiffBlobBytes {
+				u = fmt.Sprintf("--- /dev/null\n+++ b/%s\nFile diff omitted: blob exceeds inline HTML diff limit (%d bytes)\n", safePath, b.Size)
+			} else {
+				bBytes, err := treeStore.ReadBlob(b.SHA256)
+				if err != nil {
+					continue
+				}
+				if len(bBytes) > maxHTMLDiffBlobBytes {
+					u = fmt.Sprintf("--- /dev/null\n+++ b/%s\nFile diff omitted: blob exceeds inline HTML diff limit (%d bytes)\n", safePath, len(bBytes))
+				} else {
+					u = redact.String(formatFileUnifiedDiff("/dev/null", "b/"+safePath, nil, bBytes))
+				}
+			}
+			u = capHTMLTextWithBudget(u, maxHTMLFileDiffRunes, remainingDiffBudget)
 			res.Changes = append(res.Changes, FileDiffEntry{Path: safePath, Status: "added", Unified: u})
 		case inA && !inB:
-			aBytes, err := treeStore.ReadBlob(a.SHA256)
-			if err != nil {
+			res.FilesDel++
+			if len(res.Changes) >= maxHTMLDiffFilesPerStep {
+				res.OmittedFiles++
 				continue
 			}
-			u := redact.String(formatFileUnifiedDiff("a/"+safePath, "/dev/null", aBytes, nil))
-			res.FilesDel++
+			var u string
+			if a.Size > maxHTMLDiffBlobBytes {
+				u = fmt.Sprintf("--- a/%s\n+++ /dev/null\nFile diff omitted: blob exceeds inline HTML diff limit (%d bytes)\n", safePath, a.Size)
+			} else {
+				aBytes, err := treeStore.ReadBlob(a.SHA256)
+				if err != nil {
+					continue
+				}
+				if len(aBytes) > maxHTMLDiffBlobBytes {
+					u = fmt.Sprintf("--- a/%s\n+++ /dev/null\nFile diff omitted: blob exceeds inline HTML diff limit (%d bytes)\n", safePath, len(aBytes))
+				} else {
+					u = redact.String(formatFileUnifiedDiff("a/"+safePath, "/dev/null", aBytes, nil))
+				}
+			}
+			u = capHTMLTextWithBudget(u, maxHTMLFileDiffRunes, remainingDiffBudget)
 			res.Changes = append(res.Changes, FileDiffEntry{Path: safePath, Status: "deleted", Unified: u})
 		default:
-			aBytes, errA := treeStore.ReadBlob(a.SHA256)
-			bBytes, errB := treeStore.ReadBlob(b.SHA256)
-			if errA != nil || errB != nil {
+			res.FilesMod++
+			if len(res.Changes) >= maxHTMLDiffFilesPerStep {
+				res.OmittedFiles++
 				continue
 			}
-			u := redact.String(formatFileUnifiedDiff("a/"+safePath, "b/"+safePath, aBytes, bBytes))
-			res.FilesMod++
+			var u string
+			if a.Size > maxHTMLDiffBlobBytes || b.Size > maxHTMLDiffBlobBytes {
+				u = fmt.Sprintf("--- a/%s\n+++ b/%s\nFile diff omitted: blob exceeds inline HTML diff limit (old=%d bytes, new=%d bytes)\n", safePath, safePath, a.Size, b.Size)
+			} else {
+				aBytes, errA := treeStore.ReadBlob(a.SHA256)
+				bBytes, errB := treeStore.ReadBlob(b.SHA256)
+				if errA != nil || errB != nil {
+					continue
+				}
+				if len(aBytes) > maxHTMLDiffBlobBytes || len(bBytes) > maxHTMLDiffBlobBytes {
+					u = fmt.Sprintf("--- a/%s\n+++ b/%s\nFile diff omitted: blob exceeds inline HTML diff limit (old=%d bytes, new=%d bytes)\n", safePath, safePath, len(aBytes), len(bBytes))
+				} else {
+					u = redact.String(formatFileUnifiedDiff("a/"+safePath, "b/"+safePath, aBytes, bBytes))
+				}
+			}
+			u = capHTMLTextWithBudget(u, maxHTMLFileDiffRunes, remainingDiffBudget)
 			res.Changes = append(res.Changes, FileDiffEntry{Path: safePath, Status: "modified", Unified: u})
 		}
 	}
@@ -971,6 +1049,10 @@ func renderHTMLCheckpointDiffCard(sb *strings.Builder, d htmlCheckpointDiff) {
 		sb.WriteString("        </div>\n")
 	}
 
+	if d.OmittedFiles > 0 {
+		sb.WriteString(fmt.Sprintf("        <pre class=\"code-block\">... and %d more changed files omitted from inline HTML diff</pre>\n", d.OmittedFiles))
+	}
+
 	sb.WriteString("      </div>\n")
 }
 
@@ -979,4 +1061,48 @@ func compactHTMLPreview(s string, maxRunes int) string {
 	clean = strings.ReplaceAll(clean, "\n", " ")
 	clean = strings.TrimSpace(clean)
 	return truncateUTF8RunesWithSuffix(clean, maxRunes, "...")
+}
+
+func sanitizeCSSClassToken(raw string) string {
+	var sb strings.Builder
+	for _, r := range strings.ToLower(raw) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			sb.WriteRune(r)
+		}
+	}
+	if sb.Len() == 0 {
+		return "unknown"
+	}
+	return sb.String()
+}
+
+func capHTMLTextWithBudget(s string, maxItemRunes int, remainingBudget *int) string {
+	origRunes := utf8.RuneCountInString(s)
+	limit := maxItemRunes
+	if remainingBudget != nil {
+		if *remainingBudget <= 0 {
+			return fmt.Sprintf("... [truncated: report inline content limit reached; %d bytes omitted]", len(s))
+		}
+		if *remainingBudget < limit {
+			limit = *remainingBudget
+		}
+	}
+	if origRunes <= limit {
+		if remainingBudget != nil {
+			*remainingBudget -= origRunes
+		}
+		return s
+	}
+	truncated := truncateUTF8RunesWithSuffix(
+		s,
+		limit,
+		fmt.Sprintf("\n... [truncated for HTML report safety: %d total bytes]", len(s)),
+	)
+	if remainingBudget != nil {
+		*remainingBudget -= limit
+		if *remainingBudget < 0 {
+			*remainingBudget = 0
+		}
+	}
+	return truncated
 }

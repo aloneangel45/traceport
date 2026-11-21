@@ -11,14 +11,16 @@ import (
 
 	"github.com/aloneangel45/traceport/pkg/checkpoint"
 	"github.com/aloneangel45/traceport/pkg/model"
+	"github.com/aloneangel45/traceport/pkg/redact"
 	"github.com/aloneangel45/traceport/pkg/storage"
 )
 
 // SearchOptions configures cross-session search behavior.
 type SearchOptions struct {
-	Query string
-	Regex bool
-	Tags  []string
+	Query  string
+	Regex  bool
+	Tags   []string
+	Redact bool // When true, scrub credentials BEFORE matching to prevent secret-extraction oracles.
 }
 
 // SearchHit describes a single match within a session.
@@ -78,7 +80,13 @@ func (e *Engine) Search(opts SearchOptions) ([]SessionSearchResult, error) {
 
 	results := make([]SessionSearchResult, 0)
 
-	for _, sess := range sessions {
+	for _, rawSess := range sessions {
+		sess := rawSess
+		if opts.Redact {
+			if scrubbed := redact.Session(&rawSess); scrubbed != nil {
+				sess = *scrubbed
+			}
+		}
 		if len(filterTags) > 0 && !storage.MatchesAllTags(sess, filterTags) {
 			continue
 		}
@@ -137,7 +145,7 @@ func (e *Engine) Search(opts SearchOptions) ([]SessionSearchResult, error) {
 		}
 
 		if treeStore != nil {
-			cpHits := searchSessionCheckpoints(sess, treeStore, matcher)
+			cpHits := searchSessionCheckpoints(sess, treeStore, matcher, opts.Redact)
 			hits = append(hits, cpHits...)
 		}
 
@@ -156,7 +164,7 @@ func (e *Engine) Search(opts SearchOptions) ([]SessionSearchResult, error) {
 	return results, nil
 }
 
-func searchSessionCheckpoints(sess model.Session, treeStore *checkpoint.TreeStore, matcher func(string) bool) []SearchHit {
+func searchSessionCheckpoints(sess model.Session, treeStore *checkpoint.TreeStore, matcher func(string) bool, scrub bool) []SearchHit {
 	var mutationHits []SearchHit
 	var prevFiles map[string]string
 
@@ -177,22 +185,30 @@ func searchSessionCheckpoints(sess model.Session, treeStore *checkpoint.TreeStor
 		if prevFiles != nil {
 			var addedPaths, modPaths, delPaths []string
 			for p, sha := range curFiles {
-				if !matcher(p) {
+				displayPath := p
+				if scrub {
+					displayPath = redact.String(p)
+				}
+				if !matcher(displayPath) {
 					continue
 				}
 				oldSHA, existed := prevFiles[p]
 				if !existed {
-					addedPaths = append(addedPaths, p)
+					addedPaths = append(addedPaths, displayPath)
 				} else if oldSHA != sha {
-					modPaths = append(modPaths, p)
+					modPaths = append(modPaths, displayPath)
 				}
 			}
 			for p := range prevFiles {
-				if !matcher(p) {
+				displayPath := p
+				if scrub {
+					displayPath = redact.String(p)
+				}
+				if !matcher(displayPath) {
 					continue
 				}
 				if _, stillThere := curFiles[p]; !stillThere {
-					delPaths = append(delPaths, p)
+					delPaths = append(delPaths, displayPath)
 				}
 			}
 			sort.Strings(addedPaths)

@@ -27,12 +27,12 @@ import (
 )
 
 // Version is injected at link time via -ldflags "-X main.Version=...".
-var Version = "1.3.0"
+var Version = "1.3.1"
 
 func displayVersion() string {
 	v := strings.TrimSpace(Version)
 	if v == "" {
-		return "v1.3.0"
+		return "v1.3.1"
 	}
 	if strings.HasPrefix(v, "v") {
 		return v

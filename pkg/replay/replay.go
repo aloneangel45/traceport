@@ -120,27 +120,42 @@ func (e *Engine) RewindWithOptions(sessionID string, targetStep int, workspaceDi
 		return res, nil
 	}
 
+	// Pre-validate snapshot availability before creating safety savepoints or modifying state.
+	useLegacyGit := false
+	var wm *checkpoint.WorkspaceManager
 	if snapshotHash != "" {
-		// Capture automatic pre-rewind safety savepoint so uncommitted work is never lost.
-		if safetyHash, sErr := treeStore.CreateSnapshot(); sErr == nil && safetyHash != "" {
-			res.SafetySnapshot = safetyHash
-			session.SafetySnapshot = safetyHash
+		if !treeStore.HasTree(snapshotHash) {
+			wm = checkpoint.NewWorkspaceManager(absWork)
+			if checkpoint.IsValidGitHash(snapshotHash) && wm.IsGitRepo() {
+				useLegacyGit = true
+			} else {
+				return nil, fmt.Errorf("snapshot %s not found in shadow-tree store or git repository", snapshotHash)
+			}
 		}
+	}
 
-		if treeStore.HasTree(snapshotHash) {
+	// Capture mandatory automatic pre-rewind safety savepoint so uncommitted work is never lost.
+	// Fail closed if the safety savepoint cannot be persisted.
+	safetyHash, sErr := treeStore.CreateSnapshot()
+	if sErr != nil {
+		return nil, fmt.Errorf("failed to create mandatory pre-rewind safety savepoint: %w", sErr)
+	}
+	if safetyHash == "" {
+		return nil, fmt.Errorf("failed to create mandatory pre-rewind safety savepoint: empty snapshot hash")
+	}
+	res.SafetySnapshot = safetyHash
+	session.SafetySnapshot = safetyHash
+
+	if snapshotHash != "" {
+		if !useLegacyGit {
 			rStats, err := treeStore.RestoreSnapshotWithStats(snapshotHash)
 			if err != nil {
 				return nil, fmt.Errorf("failed to restore zstd workspace snapshot: %w", err)
 			}
 			res.RestoreStats = rStats
 		} else {
-			wm := checkpoint.NewWorkspaceManager(absWork)
-			if checkpoint.IsValidGitHash(snapshotHash) && wm.IsGitRepo() {
-				if err := wm.RestoreSnapshot(snapshotHash); err != nil {
-					return nil, fmt.Errorf("failed to restore legacy git snapshot: %w", err)
-				}
-			} else {
-				return nil, fmt.Errorf("snapshot %s not found in shadow-tree store or git repository", snapshotHash)
+			if err := wm.RestoreSnapshot(snapshotHash); err != nil {
+				return nil, fmt.Errorf("failed to restore legacy git snapshot: %w", err)
 			}
 		}
 	}

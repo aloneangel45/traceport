@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -286,5 +288,93 @@ func TestWatch_ValidationErrors(t *testing.T) {
 		if _, err := Watch(context.Background(), store, opts); err == nil {
 			t.Fatalf("case %d: expected validation error for %+v", i, opts)
 		}
+	}
+}
+
+func TestWatch_SymlinkLoopsAndZeroDebounceRaceSafety(t *testing.T) {
+	store, err := storage.NewStoreWithPath(filepath.Join(t.TempDir(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	workDir := t.TempDir()
+	subA := filepath.Join(workDir, "dir_a")
+	subB := filepath.Join(workDir, "dir_b")
+	if err := os.MkdirAll(subA, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(subB, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subA, "file.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create self-referencing and mutual symlink/junction loops inside the watched workspace.
+	createDirLink := func(link, target string) {
+		if err := os.Symlink(target, link); err != nil && runtime.GOOS == "windows" {
+			_ = exec.Command("cmd.exe", "/c", "mklink", "/J", link, target).Run()
+		}
+	}
+	createDirLink(filepath.Join(subA, "loop_self"), workDir)
+	createDirLink(filepath.Join(subA, "loop_to_b"), subB)
+	createDirLink(filepath.Join(subB, "loop_to_a"), subA)
+	_ = os.Symlink(filepath.Join(workDir, "nonexistent_target"), filepath.Join(workDir, "dangling_link"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	snapCh := make(chan model.Frame, 16)
+	doneCh := make(chan struct {
+		sess *model.Session
+		err  error
+	}, 1)
+
+	go func() {
+		sess, wErr := Watch(ctx, store, WatchOptions{
+			Dir:          workDir,
+			Interval:     15 * time.Millisecond,
+			Debounce:     0, // zero debounce + rapid cancellation race test
+			MaxSnapshots: 20,
+			OnSnapshot: func(f model.Frame) {
+				snapCh <- f
+			},
+		})
+		doneCh <- struct {
+			sess *model.Session
+			err  error
+		}{sess: sess, err: wErr}
+	}()
+
+	// Must capture initial snapshot quickly without hanging on symlink loops!
+	select {
+	case f := <-snapCh:
+		if f.Index != 1 {
+			t.Fatalf("expected initial frame #1, got #%d", f.Index)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Watch hung on symlink loop during initial snapshot!")
+	}
+
+	// Mutate real file and immediately cancel after capturing snapshot #2.
+	if err := os.WriteFile(filepath.Join(subA, "file.go"), []byte("package a\nconst V = 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case f := <-snapCh:
+		if f.Index != 2 {
+			t.Fatalf("expected frame #2, got #%d", f.Index)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Watch failed to record mutation in workspace with symlink loops")
+	}
+
+	cancel()
+	res := <-doneCh
+	if res.err != nil {
+		t.Fatalf("Watch returned error: %v", res.err)
+	}
+	if res.sess == nil || res.sess.Status != "completed" {
+		t.Fatalf("expected completed session on shutdown, got %+v", res.sess)
 	}
 }

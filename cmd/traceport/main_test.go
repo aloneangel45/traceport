@@ -361,8 +361,8 @@ func TestCLI_TagsExportRedactAndSearch(t *testing.T) {
 }
 
 func TestCLI_FlagReorderingDoubleDashAndPositionalValidation(t *testing.T) {
-	if Version != "1.3.0" || displayVersion() != "v1.3.0" {
-		t.Fatalf("expected default Version=1.3.0 / v1.3.0, got Version=%q display=%q", Version, displayVersion())
+	if Version != "1.3.1" || displayVersion() != "v1.3.1" {
+		t.Fatalf("expected default Version=1.3.1 / v1.3.1, got Version=%q display=%q", Version, displayVersion())
 	}
 
 	t.Setenv("TRACEPORT_CLI_HELPER", "1")
@@ -543,6 +543,22 @@ func TestCLI_V130_PresetMCPHTMLAndWatch(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) != 2 || !strings.Contains(lines[0], `"traceport"`) || !strings.Contains(lines[1], `"rewind_workspace"`) {
 		t.Fatalf("unexpected mcp stdout:\n%s", out.String())
+	}
+
+	// 5. watch flag validation (--interval <= 0, --debounce < 0, --max-snapshots <= 0)
+	badWatchInvocations := [][]string{
+		{"watch", "--interval", "0s"},
+		{"watch", "--interval", "-1s"},
+		{"watch", "--debounce", "-1ms"},
+		{"watch", "--max-snapshots", "0"},
+		{"watch", "--max-snapshots", "-5"},
+	}
+	for _, inv := range badWatchInvocations {
+		out.Reset()
+		errBuf.Reset()
+		if code := run(inv, &out, &errBuf); code == 0 {
+			t.Fatalf("expected non-zero exit code for invalid watch flags %v", inv)
+		}
 	}
 }
 

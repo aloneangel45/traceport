@@ -192,3 +192,55 @@ func TestApplyAndPreview_AtomicWriteAndPreserve(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildMergedConfig_URLsBOMLargeIntsHTMLCharsAndUnterminatedComment(t *testing.T) {
+	// Include UTF-8 BOM, http:// and https:// URLs with query &, block-comment tokens inside strings,
+	// escaped quotes with //, 64-bit integer precision, and trailing commas.
+	existing := append([]byte{0xEF, 0xBB, 0xBF}, []byte(`{
+  // Line comment with http://ignored.example
+  "bigTimestamp": 1794348120984102999,
+  "mcpServers": {
+    "remote": {
+      "url": "http://localhost:8080/mcp?a=1&b=2&tag=<prod>",
+      "note": "keep /* not a comment */ and \" // still inside string",
+      "winPath": "C:\\Users\\Dev\\", // trailing comment after escaped backslash!
+    },
+  },
+}`)...)
+
+	merged, err := BuildMergedConfig(ClientCursor, "/usr/local/bin/traceport", existing)
+	if err != nil {
+		t.Fatalf("BuildMergedConfig with BOM & URLs failed: %v", err)
+	}
+
+	mergedStr := string(merged)
+	if !strings.Contains(mergedStr, `"bigTimestamp": 1794348120984102999`) {
+		t.Fatalf("64-bit integer precision was corrupted:\n%s", mergedStr)
+	}
+	if !strings.Contains(mergedStr, `"http://localhost:8080/mcp?a=1&b=2&tag=<prod>"`) {
+		t.Fatalf("URL or HTML characters (&, <, >) were corrupted:\n%s", mergedStr)
+	}
+	if strings.Contains(mergedStr, `\u0026`) || strings.Contains(mergedStr, `\u003c`) {
+		t.Fatalf("unexpected HTML escaping in merged JSON config:\n%s", mergedStr)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(merged, &parsed); err != nil {
+		t.Fatalf("merged JSON invalid: %v\n%s", err, mergedStr)
+	}
+	remote := parsed["mcpServers"].(map[string]any)["remote"].(map[string]any)
+	if remote["note"] != `keep /* not a comment */ and " // still inside string` {
+		t.Fatalf("string literal containing /* and // was corrupted: %q", remote["note"])
+	}
+	if remote["winPath"] != `C:\Users\Dev\` {
+		t.Fatalf("escaped backslash before closing quote was corrupted: %q", remote["winPath"])
+	}
+
+	// Unterminated block comment and trailing garbage MUST return errors.
+	if _, err := BuildMergedConfig(ClientClaude, "traceport", []byte(`{"a": 1} /* unterminated`)); err == nil {
+		t.Fatalf("expected error for unterminated block comment")
+	}
+	if _, err := BuildMergedConfig(ClientClaude, "traceport", []byte(`{"a": 1} extra`)); err == nil {
+		t.Fatalf("expected error for trailing garbage after JSON object")
+	}
+}

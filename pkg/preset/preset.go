@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -95,10 +96,20 @@ func BuildMergedConfig(client Client, binaryPath string, existingData []byte) ([
 	}
 
 	root := make(map[string]any)
-	cleaned := strings.TrimSpace(string(stripJSONC(existingData)))
+	stripped, err := stripJSONC(existingData)
+	if err != nil {
+		return nil, fmt.Errorf("parse existing %s config: %w", client, err)
+	}
+	cleaned := strings.TrimSpace(string(stripped))
 	if cleaned != "" {
-		if err := json.Unmarshal([]byte(cleaned), &root); err != nil {
+		dec := json.NewDecoder(strings.NewReader(cleaned))
+		dec.UseNumber()
+		if err := dec.Decode(&root); err != nil {
 			return nil, fmt.Errorf("parse existing %s config: %w", client, err)
+		}
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			return nil, fmt.Errorf("parse existing %s config: unexpected trailing JSON data", client)
 		}
 		if root == nil {
 			root = make(map[string]any)
@@ -129,11 +140,14 @@ func BuildMergedConfig(client Client, binaryPath string, existingData []byte) ([
 		return nil, fmt.Errorf("unsupported client %q", client)
 	}
 
-	out, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
+	var outBuf bytes.Buffer
+	enc := json.NewEncoder(&outBuf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(root); err != nil {
 		return nil, fmt.Errorf("marshal %s config: %w", client, err)
 	}
-	return append(out, '\n'), nil
+	return outBuf.Bytes(), nil
 }
 
 // Preview computes the merged MCP JSON config for configPath (reading any existing file if present)
@@ -257,9 +271,12 @@ func writeAtomicPresetFile(dest string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// stripJSONC strips // line comments, /* */ block comments, and trailing commas
-// outside JSON string literals so VS Code / Cursor JSONC configs parse cleanly.
-func stripJSONC(src []byte) []byte {
+// stripJSONC strips UTF-8 BOM, // line comments, /* */ block comments, and trailing commas
+// outside JSON string literals so VS Code / Cursor JSONC configs parse cleanly without
+// corrupting URLs (http://, https://) or other literals inside quoted strings.
+func stripJSONC(src []byte) ([]byte, error) {
+	src = bytes.TrimPrefix(src, []byte{0xEF, 0xBB, 0xBF})
+
 	var out bytes.Buffer
 	out.Grow(len(src))
 	inString := false
@@ -298,10 +315,19 @@ func stripJSONC(src []byte) []byte {
 			}
 			if src[i+1] == '*' {
 				i += 2
-				for i+1 < len(src) && !(src[i] == '*' && src[i+1] == '/') {
+				closed := false
+				for i+1 < len(src) {
+					if src[i] == '*' && src[i+1] == '/' {
+						i++
+						closed = true
+						break
+					}
 					i++
 				}
-				i++
+				if !closed {
+					return nil, fmt.Errorf("unterminated block comment in JSONC")
+				}
+				out.WriteByte(' ')
 				continue
 			}
 		}
@@ -344,5 +370,5 @@ func stripJSONC(src []byte) []byte {
 		final.WriteByte(c)
 	}
 
-	return final.Bytes()
+	return final.Bytes(), nil
 }

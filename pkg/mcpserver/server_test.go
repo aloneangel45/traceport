@@ -336,3 +336,243 @@ func TestMCPServer_ErrorHandling(t *testing.T) {
 		t.Fatalf("expected -32602 invalid params for unknown tool, got %v", resp)
 	}
 }
+
+func TestMCPServer_JSONRPC20EdgeCasesAndMultiHeaderFraming(t *testing.T) {
+	store, workDir, _, _ := seedTestWorkspaceAndSession(t)
+	srv := New(store, workDir, "1.3.1")
+
+	// 1. `"id": null` MUST receive a response with `"id": null` (NOT dropped as notification!).
+	var nullOut bytes.Buffer
+	if err := srv.ServeStdio(context.Background(), strings.NewReader(`{"jsonrpc":"2.0","id":null,"method":"ping"}`+"\n"), &nullOut); err != nil {
+		t.Fatalf("ServeStdio id:null failed: %v", err)
+	}
+	if strings.TrimSpace(nullOut.String()) == "" {
+		t.Fatalf("CRITICAL: request with id:null was silently dropped as a notification!")
+	}
+	var nullResp map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(nullOut.Bytes()), &nullResp); err != nil {
+		t.Fatalf("invalid id:null response: %v\nraw: %s", err, nullOut.String())
+	}
+	if idVal, exists := nullResp["id"]; !exists || idVal != nil {
+		t.Fatalf("expected explicit id:null in response, got %v", nullResp)
+	}
+	if _, hasErr := nullResp["error"]; hasErr {
+		t.Fatalf("unexpected error for id:null ping: %v", nullResp)
+	}
+
+	// 2. JSON-RPC 2.0 batch mixing notification + valid request + invalid non-object element.
+	batchReq := `[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":7,"method":"ping"},123]`
+	var batchOut bytes.Buffer
+	if err := srv.ServeStdio(context.Background(), strings.NewReader(batchReq+"\n"), &batchOut); err != nil {
+		t.Fatalf("ServeStdio batch failed: %v", err)
+	}
+	var batchReplies []map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(batchOut.Bytes()), &batchReplies); err != nil {
+		t.Fatalf("invalid batch JSON response: %v\nraw: %s", err, batchOut.String())
+	}
+	if len(batchReplies) != 2 {
+		t.Fatalf("expected 2 replies in batch (notification omitted), got %d: %v", len(batchReplies), batchReplies)
+	}
+	if int(batchReplies[0]["id"].(float64)) != 7 || batchReplies[0]["error"] != nil {
+		t.Fatalf("unexpected first batch reply: %v", batchReplies[0])
+	}
+	if int(batchReplies[1]["error"].(map[string]any)["code"].(float64)) != -32600 {
+		t.Fatalf("expected -32600 Invalid Request for scalar batch element 123, got %v", batchReplies[1])
+	}
+
+	// 3. Batch containing ONLY notifications must emit ZERO bytes.
+	var notifBatchOut bytes.Buffer
+	if err := srv.ServeStdio(context.Background(), strings.NewReader(`[{"jsonrpc":"2.0","method":"notifications/initialized"}]`+"\n"), &notifBatchOut); err != nil {
+		t.Fatalf("ServeStdio notif-only batch failed: %v", err)
+	}
+	if notifBatchOut.Len() != 0 {
+		t.Fatalf("expected zero output for notification-only batch, got %q", notifBatchOut.String())
+	}
+
+	// 4. Protocol error codes for empty batch, non-object JSON, wrong jsonrpc, invalid id, trailing garbage, malformed params.
+	errCases := []struct {
+		name string
+		req  string
+		code int
+	}{
+		{"empty batch", `[]`, -32600},
+		{"scalar number", `123`, -32600},
+		{"scalar null", `null`, -32600},
+		{"wrong jsonrpc version", `{"jsonrpc":"1.0","id":1,"method":"ping"}`, -32600},
+		{"missing jsonrpc version", `{"id":1,"method":"ping"}`, -32600},
+		{"array id", `{"jsonrpc":"2.0","id":[1],"method":"ping"}`, -32600},
+		{"bool id", `{"jsonrpc":"2.0","id":true,"method":"ping"}`, -32600},
+		{"trailing garbage", `{"jsonrpc":"2.0","id":1,"method":"ping"} trailing`, -32700},
+		{"primitive params", `{"jsonrpc":"2.0","id":1,"method":"ping","params":"bad"}`, -32602},
+		{"tools/call array params", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}`, -32602},
+		{"tools/call non-object arguments", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sessions","arguments":[1,2]}}`, -32602},
+		{"rewind step zero", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rewind_workspace","arguments":{"session_id":"trace_mcp_test_1","step":0}}}`, -32602},
+		{"rewind negative step", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rewind_workspace","arguments":{"session_id":"trace_mcp_test_1","step":-3}}}`, -32602},
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := runSingleRPC(t, srv, tc.req)
+			errObj, ok := resp["error"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected JSON-RPC error %d, got %v", tc.code, resp)
+			}
+			if int(errObj["code"].(float64)) != tc.code {
+				t.Fatalf("expected error code %d, got %v", tc.code, errObj)
+			}
+		})
+	}
+
+	// 5. Content-Length framing with Content-Type MIME header BEFORE Content-Length!
+	body := `{"jsonrpc":"2.0","id":"mime-1","method":"ping"}`
+	framed := fmt.Sprintf("Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	var mimeOut bytes.Buffer
+	if err := srv.ServeStdio(context.Background(), strings.NewReader(framed), &mimeOut); err != nil {
+		t.Fatalf("ServeStdio multi-header Content-Length failed: %v", err)
+	}
+	if !strings.HasPrefix(mimeOut.String(), "Content-Length: ") || !strings.Contains(mimeOut.String(), `"mime-1"`) {
+		t.Fatalf("unexpected multi-header Content-Length reply: %q", mimeOut.String())
+	}
+
+	// 6. Conflicting duplicate Content-Length headers and oversized frame must fail cleanly.
+	conflictReq := "Content-Length: 10\r\nContent-Length: 20\r\n\r\n1234567890"
+	if err := srv.ServeStdio(context.Background(), strings.NewReader(conflictReq), &bytes.Buffer{}); err == nil {
+		t.Fatalf("expected error on conflicting duplicate Content-Length headers")
+	}
+	oversizedReq := fmt.Sprintf("Content-Length: %d\r\n\r\n{}", maxFrameBytes+1)
+	if err := srv.ServeStdio(context.Background(), strings.NewReader(oversizedReq), &bytes.Buffer{}); err == nil {
+		t.Fatalf("expected error on oversized Content-Length frame")
+	}
+}
+
+func TestMCPServer_RedactionOracleErrorsSafetyAndSizeCaps(t *testing.T) {
+	store, workDir, sess, secrets := seedTestWorkspaceAndSession(t)
+
+	// Add a second session containing a huge 250 KiB stdout frame, a secret inside a tag, and NO checkpoint snapshots.
+	tagSecret := "ghp_" + "lowercasetagsecret123456"
+	hugeChunk := "OPENAI_API_KEY=" + secrets["openai"] + "\n" + strings.Repeat("A", 250*1024)
+	hugeSess := &model.Session{
+		ID:           "trace_mcp_huge_nosnap",
+		Command:      "echo big",
+		WorkspaceDir: workDir,
+		Tags:         []string{tagSecret, "huge"},
+		StartTime:    time.Now().UTC(),
+		Status:       "completed",
+		Frames: []model.Frame{
+			{
+				Index:     1,
+				Timestamp: time.Now().UTC(),
+				Type:      model.EventOutput,
+				Content:   hugeChunk,
+			},
+			{
+				Index:     2,
+				Timestamp: time.Now().UTC(),
+				Type:      model.EventOutput,
+				Content:   "second frame",
+			},
+		},
+	}
+	if err := store.SaveSession(hugeSess); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(store, workDir, "1.3.1")
+
+	// 1. Error messages MUST redact secrets (invalid tag filter echoing secret!).
+	badTagReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sessions","arguments":{"tag":"invalid %s"}}}`, secrets["openai"])
+	badTagResp := runSingleRPC(t, srv, badTagReq)
+	badTagText, isErr := extractToolText(t, badTagResp)
+	if !isErr {
+		t.Fatalf("expected tool error for invalid tag")
+	}
+	if strings.Contains(badTagText, secrets["openai"]) {
+		t.Fatalf("SECURITY FAILURE: error message leaked secret: %s", badTagText)
+	}
+
+	// 2. Tags containing token patterns MUST be redacted in list_sessions and inspect_session.
+	listResp := runSingleRPC(t, srv, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_sessions","arguments":{"limit":10}}}`)
+	listText, isErr := extractToolText(t, listResp)
+	if isErr || strings.Contains(listText, tagSecret) {
+		t.Fatalf("SECURITY FAILURE: list_sessions leaked tag secret: isErr=%v text=%s", isErr, listText)
+	}
+
+	// 3. Search oracle defense: querying the raw secret substring MUST NOT match!
+	oracleReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_traces","arguments":{"query":%q}}}`, "McpTestSecretOpenAIKey")
+	oracleResp := runSingleRPC(t, srv, oracleReq)
+	oracleText, isErr := extractToolText(t, oracleResp)
+	if isErr {
+		t.Fatalf("search_traces oracle test errored: %s", oracleText)
+	}
+	var oracleObj map[string]any
+	if err := json.Unmarshal([]byte(oracleText), &oracleObj); err != nil {
+		t.Fatal(err)
+	}
+	if int(oracleObj["total_sessions"].(float64)) != 0 {
+		t.Fatalf("SECURITY FAILURE: search_traces acted as a secret-extraction oracle! matched %v sessions", oracleObj["total_sessions"])
+	}
+
+	// 4. inspect_session MUST cap huge frame payloads cleanly without leaking secrets.
+	inspResp := runSingleRPC(t, srv, fmt.Sprintf(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inspect_session","arguments":{"session_id":%q}}}`, hugeSess.ID))
+	inspText, isErr := extractToolText(t, inspResp)
+	if isErr {
+		t.Fatalf("inspect_session huge failed: %s", inspText)
+	}
+	if strings.Contains(inspText, secrets["openai"]) || strings.Contains(inspText, tagSecret) {
+		t.Fatalf("SECURITY FAILURE: huge inspect_session leaked secret")
+	}
+	if len(inspText) > 64*1024 {
+		t.Fatalf("expected huge inspect_session payload capped, got %d bytes", len(inspText))
+	}
+	var inspObj map[string]any
+	if err := json.Unmarshal([]byte(inspText), &inspObj); err != nil {
+		t.Fatal(err)
+	}
+	if inspObj["truncated"] != true {
+		t.Fatalf("expected truncated=true for huge frame content")
+	}
+
+	// 5. diff_checkpoints MUST cap massive diffs cleanly without blowing up LLM context.
+	ts, err := checkpoint.NewTreeStore(workDir, store.RootDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+	bigLines := strings.Repeat("OPENAI_API_KEY="+secrets["openai"]+" line_payload_padding_0123456789\n", 4000)
+	if err := os.WriteFile(filepath.Join(workDir, "big_generated.txt"), []byte(bigLines), 0644); err != nil {
+		t.Fatal(err)
+	}
+	diffResp := runSingleRPC(t, srv, fmt.Sprintf(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"diff_checkpoints","arguments":{"session_id":%q,"from_step":1,"to_step":0}}}`, sess.ID))
+	diffText, isErr := extractToolText(t, diffResp)
+	if isErr {
+		t.Fatalf("diff_checkpoints big failed: %s", diffText)
+	}
+	if strings.Contains(diffText, secrets["openai"]) {
+		t.Fatalf("SECURITY FAILURE: truncated diff_checkpoints leaked secret")
+	}
+	if len(diffText) > 200*1024 {
+		t.Fatalf("expected diff_checkpoints response capped, got %d bytes", len(diffText))
+	}
+	var diffObj map[string]any
+	if err := json.Unmarshal([]byte(diffText), &diffObj); err != nil {
+		t.Fatal(err)
+	}
+	if diffObj["truncated"] != true {
+		t.Fatalf("expected truncated=true for massive unified diff")
+	}
+
+	// 6. rewind_workspace with dry_run=false on a session WITHOUT prior checkpoint snapshots
+	//    MUST still create a mandatory pre-rewind safety savepoint!
+	rwResp := runSingleRPC(t, srv, fmt.Sprintf(`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"rewind_workspace","arguments":{"session_id":%q,"step":1,"dry_run":false}}}`, hugeSess.ID))
+	rwText, isErr := extractToolText(t, rwResp)
+	if isErr {
+		t.Fatalf("rewind_workspace on no-snapshot session failed: %s", rwText)
+	}
+	var rwObj map[string]any
+	if err := json.Unmarshal([]byte(rwText), &rwObj); err != nil {
+		t.Fatal(err)
+	}
+	safetyHash, _ := rwObj["safety_snapshot"].(string)
+	if len(safetyHash) != 64 || !ts.HasTree(safetyHash) {
+		t.Fatalf("expected valid persisted pre-rewind safety_snapshot even when session had no checkpoints, got %q", safetyHash)
+	}
+}

@@ -284,10 +284,15 @@ func Session(sess *model.Session) *model.Session {
 		return nil
 	}
 	cp := *sess
+	cp.ID = String(sess.ID)
 	cp.Command = String(sess.Command)
 	cp.WorkspaceDir = String(sess.WorkspaceDir)
+	cp.Status = String(sess.Status)
 	if sess.Tags != nil {
-		cp.Tags = append([]string{}, sess.Tags...)
+		cp.Tags = make([]string, len(sess.Tags))
+		for i, tag := range sess.Tags {
+			cp.Tags[i] = String(tag)
+		}
 	}
 	cp.Frames = make([]model.Frame, len(sess.Frames))
 	for i, f := range sess.Frames {

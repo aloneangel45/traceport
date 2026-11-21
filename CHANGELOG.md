@@ -5,6 +5,25 @@ All notable changes to **TracePort** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-21
+
+### Fixed
+- **MCP Server JSON-RPC 2.0, Multi-Header Framing, Redaction & Size-Cap Hardening (`pkg/mcpserver`, `pkg/replay`, `pkg/redact`):**
+  - Fixed `"id": null` JSON-RPC 2.0 requests being silently dropped as notifications due to Go `encoding/json` decoding `null` into `nil` `json.RawMessage`; requests are now parsed via a raw field map to distinguish omitted `"id"` from `"id": null`.
+  - Enforced strict JSON-RPC 2.0 validation: non-object payloads (`123`, `null`, etc.), missing/wrong `"jsonrpc"`, invalid `"id"` types, and oversized batches (`> 100`) now return `-32600 Invalid Request`; trailing garbage returns `-32700 Parse error`; malformed `params` return `-32602 Invalid params`.
+  - Fixed `Content-Length` stdio framing when other MIME headers (e.g. `Content-Type`) precede `Content-Length`, added bounded header line reads (`16 KiB` / max `64` headers), and rejected conflicting duplicate `Content-Length` headers and oversized frames.
+  - Closed a `search_traces` secret-extraction oracle by scrubbing sessions with `pkg/redact` before query matching (`SearchOptions.Redact`), extended `redact.Session` to scrub `Tags`, `Status`, and `ID`, and redacted all MCP error messages and `rewind_workspace` restore plans.
+  - Enforced response truncation caps across `inspect_session`, `diff_checkpoints`, `search_traces`, and `rewind_workspace` (redacting before truncating) so massive stdout/diffs never blow up LLM context windows.
+  - Made pre-rewind safety savepoints strictly fail-closed in `Engine.RewindWithOptions` and guaranteed creation for every live (`dry_run=false`) rewind, including sessions without prior checkpoint snapshots.
+- **Interactive Dark HTML Timeline Export Hardening (`pkg/replay/html.go`):**
+  - Added strict per-frame, per-tool, pre-diff blob (`512 KiB`), per-file diff, file-count (`200`), and total-report size budgets so huge sessions (e.g. multi-MB stdout or generated files) produce fast, bounded, usable HTML reports with explicit truncation notices.
+  - Added `<meta http-equiv="Content-Security-Policy" ...>`, sanitized CSS class tokens for `Frame.Type`, bound panels by unique `data-panel-idx` (preventing duplicate `Frame.Index` collisions), enabled sidebar search across changed file paths in inspector panels, and hid panels cleanly on empty search matches.
+- **Workspace Watcher & `.gitignore` / `.traceportignore` Hardening (`pkg/recorder/watch.go`, `pkg/checkpoint/ignore.go`):**
+  - Fixed cross-platform Windows backslash matching in `IgnoreMatcher.ShouldIgnore` / `CanSkipDir` on Linux/macOS, stripped UTF-8 BOM on line 1, preserved escaped trailing spaces (`\ `), normalized Windows backslash ignore rules, fixed subdirectory matching under ignored directories, fixed `CanSkipDir` pruning when glob negations (`!*/keep.txt`, `!a/*/keep.txt`) are present, and fixed trailing `/**` to match descendants only.
+  - Fixed `recorder.Watch` advancing `lastCommittedFP` before `recordCheckpoint` succeeded (which previously dropped checkpoints after transient file locks), added deterministic `ctx.Err()` shutdown checks, and flushed unpolled final workspace mutations on `ctx.Done()`.
+- **IDE Preset JSONC & Serialization Hardening (`pkg/preset/preset.go`):**
+  - Stripped UTF-8 BOM from existing IDE configs, rejected unterminated `/*` block comments and trailing JSON garbage, preserved 64-bit integer precision via `json.Decoder.UseNumber()`, and disabled Go HTML escaping (`SetEscapeHTML(false)`) so existing server URLs/args containing `&`, `<`, or `>` are never corrupted into `\u0026`/`\u003c`.
+
 ## [1.3.0] - 2026-11-21
 
 ### Added

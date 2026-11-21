@@ -236,21 +236,39 @@ func Watch(ctx context.Context, store *storage.Store, opts WatchOptions) (*model
 		return step
 	}
 
-	timer := time.NewTimer(nextWait())
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			if pending && snapshotsRecorded < maxSnapshots {
+	flushFinalAndComplete := func() (*model.Session, error) {
+		if snapshotsRecorded < maxSnapshots {
+			needFinal := pending
+			if !needFinal {
+				if fp, fpErr := treeStore.WorkspaceFingerprint(); fpErr == nil && fp != lastCommittedFP {
+					needFinal = true
+				}
+			}
+			if needFinal {
 				if _, err := recordCheckpoint("Final workspace snapshot"); err != nil {
 					fmt.Fprintf(stderr, "[warn] final watch snapshot failed: %v\n", err)
 				}
 			}
-			fmt.Fprintf(stdout, "[ok] watch session completed: %s (%d snapshots)\n", sessionID, snapshotsRecorded)
-			return finalize()
+		}
+		fmt.Fprintf(stdout, "[ok] watch session completed: %s (%d snapshots)\n", sessionID, snapshotsRecorded)
+		return finalize()
+	}
+
+	timer := time.NewTimer(nextWait())
+	defer timer.Stop()
+
+	for {
+		if ctx.Err() != nil {
+			return flushFinalAndComplete()
+		}
+		select {
+		case <-ctx.Done():
+			return flushFinalAndComplete()
 
 		case <-timer.C:
+			if ctx.Err() != nil {
+				return flushFinalAndComplete()
+			}
 			fp, err := treeStore.WorkspaceFingerprint()
 			if err != nil {
 				fmt.Fprintf(stderr, "[warn] watch scan failed: %v\n", err)
@@ -272,21 +290,27 @@ func Watch(ctx context.Context, store *storage.Store, opts WatchOptions) (*model
 			}
 
 			if pending && (debounce == 0 || time.Since(lastChangeAt) >= debounce) {
+				candidateFP := pendingFP
 				pending = false
-				lastCommittedFP = pendingFP
 				pendingFP = ""
 				label := fmt.Sprintf("Watch workspace checkpoint #%d", snapshotsRecorded+1)
 				recorded, snapErr := recordCheckpoint(label)
 				if snapErr != nil {
+					// Keep lastCommittedFP unchanged so the next poll retries after transient locks.
 					fmt.Fprintf(stderr, "[warn] watch checkpoint failed: %v\n", snapErr)
 				} else if recorded {
 					if postFP, fpErr := treeStore.WorkspaceFingerprint(); fpErr == nil {
 						lastCommittedFP = postFP
+					} else {
+						lastCommittedFP = candidateFP
 					}
 					if snapshotsRecorded >= maxSnapshots {
 						fmt.Fprintf(stdout, "[traceport] reached max snapshots (%d); completing watch session %s\n", maxSnapshots, sessionID)
 						return finalize()
 					}
+				} else {
+					// Tree hash unchanged (e.g. mtime-only touch or reverted edit); advance baseline FP.
+					lastCommittedFP = candidateFP
 				}
 			}
 
