@@ -15,12 +15,13 @@ import (
 
 // ExportOptions configures portable session export formatting and secret scrubbing.
 type ExportOptions struct {
-	Format string // "json" (default), "markdown" (or "md")
+	Format string // "json" (default), "markdown" (or "md"), "html"
 	Redact bool
 }
 
 // ExportSession renders sessionID as either a self-contained monolithic JSON document
-// (compatible with agentfixture import -traceport) or a Markdown flight audit report.
+// (compatible with agentfixture import -traceport), a Markdown flight audit report,
+// or a self-contained interactive dark-mode HTML timeline report.
 func (e *Engine) ExportSession(sessionID string, opts ExportOptions) ([]byte, error) {
 	session, err := e.store.GetSession(sessionID)
 	if err != nil {
@@ -51,8 +52,11 @@ func (e *Engine) ExportSession(sessionID string, opts ExportOptions) ([]byte, er
 	case "markdown", "md":
 		md := e.renderMarkdownAuditReport(session, opts.Redact)
 		return []byte(md), nil
+	case "html", "htm":
+		htmlDoc := e.renderHTMLTimelineReport(session)
+		return []byte(htmlDoc), nil
 	default:
-		return nil, fmt.Errorf("unsupported export format %q (expected: json, markdown, md)", opts.Format)
+		return nil, fmt.Errorf("unsupported export format %q (expected: json, markdown, md, html)", opts.Format)
 	}
 }
 

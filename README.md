@@ -49,7 +49,9 @@ TracePort wraps any CLI or agent process in a pure-Go (`CGO_ENABLED=0`) flight r
 - **Incremental Stat Cache:** Indexes `(mtime, size, mode) -> sha256` so unchanged files incur zero disk reads and zero re-compression during high-frequency polling (~0.56 ms scan across 32 files).
 - **Safe Delta Time-Travel Rewind:** Automatically records a pre-rewind safety savepoint before modifying the workspace, supports `--dry-run` previews, guards against cross-repository rewinds, skips unchanged files on disk, and removes post-checkpoint stray files while preserving `.git` and `.traceport`.
 - **Append-Only JSONL Frame Log:** Streams arbitrarily large stdout/stderr payloads (>1 MiB single lines) in `O(1)` append operations (`<id>.frames.jsonl`) alongside atomic metadata (`<id>.meta.json`).
-- **Session Tagging, Cross-Session Search & Redacted Exports:** Tag flights at record time or post-hoc (`--tag`, `traceport tag`), search across commands, stderr/stdout frames, tool calls, and checkpoint file mutations (`traceport search`), and export portable JSON fixtures or Markdown audit reports with built-in credential scrubbing (`traceport export --redact`).
+- **Native Self-Healing MCP Server & One-Command IDE Presets:** Run `traceport mcp` (JSON-RPC 2.0 stdio, NDJSON & `Content-Length` auto-framing) to give Claude Code, Cursor, VS Code, Windsurf, and Antigravity 5 redacted time-travel tools (`list_sessions`, `inspect_session`, `diff_checkpoints`, `search_traces`, `rewind_workspace`), and install IDE configs atomically with `traceport preset <claude|cursor|vscode|windsurf> --write`.
+- **Continuous Workspace Directory Watcher:** Run `traceport watch` alongside AI IDEs to poll the workspace with `.gitignore`/`.traceportignore` filtering and a quiet-window `--debounce` that coalesces rapid edit bursts into clean content-addressed checkpoints.
+- **Session Tagging, Cross-Session Search & Redacted Exports (JSON / Markdown / Dark-Mode HTML):** Tag flights (`--tag`, `traceport tag`), search across commands, frames, tool calls, and checkpoint mutations (`traceport search`), and export portable JSON fixtures, Markdown audit reports, or self-contained zero-CDN Catppuccin/Obsidian dark-mode interactive HTML timelines (`traceport export --format html`) with built-in credential scrubbing and XSS escaping.
 - **Cryptographic Integrity & Garbage Collection:** Built-in `verify` (SHA-256 manifest + blob verification), `diff` (pure-Go unified diff), and `gc` (session pruning and unreferenced blob sweeping).
 
 ---
@@ -59,7 +61,7 @@ TracePort wraps any CLI or agent process in a pure-Go (`CGO_ENABLED=0`) flight r
 ```text
 +------------------------------------------------------------------------+
 |                           traceport CLI                                |
-|  record | sessions | tag | search | export | diff | rewind | verify    |
+| record | watch | mcp | preset | search | export | diff | rewind | gc   |
 +-------------------+--------------------------------+-------------------+
                     |                                |
                     v                                v
@@ -164,6 +166,48 @@ traceport record --tag bug-42 --tag ci -- go test ./...
 
 Child exit codes and `SIGINT`/`SIGTERM` termination states are preserved and propagated to the caller.
 
+### Continuous Workspace Directory Watcher
+
+Continuously monitor a workspace while editing with Cursor, Windsurf, Claude Code, or Antigravity. Reuses the Zstandard shadow-tree engine with `.gitignore` / `.traceportignore` and cache-directory filtering (`node_modules`, `.git`, `target`, `.traceport`), coalescing rapid bursts over `--debounce` into clean deduplicated checkpoints:
+
+```bash
+# Watch current directory with defaults (2s poll, 500ms debounce, max 200 snapshots)
+traceport watch --tag cursor-session
+
+# Custom polling interval, debounce window, snapshot cap, and target directory
+traceport watch --dir ./my-repo --interval 1s --debounce 750ms --max-snapshots 100
+```
+
+Press `Ctrl+C` (`SIGINT`/`SIGTERM`) to flush any pending change and mark the session `completed`.
+
+### Native Self-Healing MCP Server & One-Command IDE Presets
+
+Start TracePort's JSON-RPC 2.0 stdio MCP server (`traceport mcp`) so autonomous agents can inspect traces, diff checkpoints, search past runs, and trigger safe time-travel rewinds directly. All text outputs, tool payloads, and unified diffs returned over MCP are automatically scrubbed via `pkg/redact`, and every non-dry-run `rewind_workspace` call enforces a mandatory pre-rewind safety savepoint:
+
+| MCP Tool | Arguments | Description |
+| :--- | :--- | :--- |
+| `list_sessions` | `tag`, `limit` | List recorded flight sessions with optional tag filter (redacted) |
+| `inspect_session` | `session_id`, `max_frames` | Inspect session metadata and redacted frame timeline |
+| `diff_checkpoints` | `session_id`, `from_step`, `to_step` | Redacted unified diff between two steps or live workspace |
+| `search_traces` | `query`, `regex`, `tag`, `limit` | Cross-session search across commands, frames, tools, and checkpoints |
+| `rewind_workspace` | `session_id`, `step`, `dry_run` | Roll back workspace to `step` with mandatory pre-rewind safety savepoint |
+
+Install or preview the MCP server entry for your IDE in one command (atomically merges while preserving existing servers and JSONC comments):
+
+```bash
+# Preview merged JSON without modifying disk
+traceport preset claude --dry-run
+
+# Atomically install into Claude Code, Cursor, VS Code, or Windsurf
+traceport preset claude --write
+traceport preset cursor --write
+traceport preset vscode --write
+traceport preset windsurf --write
+
+# Override target config path or binary path
+traceport preset cursor --write --path ./.cursor/mcp.json --binary /usr/local/bin/traceport
+```
+
 ### Tag, List & Inspect Sessions
 
 ```bash
@@ -194,9 +238,9 @@ traceport search "syntax error" --tag bug-42
 traceport search "panic:|E_[A-Z_]+" --regex --json
 ```
 
-### Portable Session Export & Secret Redaction
+### Portable Session Export, Interactive HTML Timeline & Secret Redaction
 
-Export a self-contained monolithic JSON `model.Session` (compatible out-of-the-box with `agentfixture import -traceport <file>` and CI artifacts) or a structured Markdown flight audit report, optionally scrubbing API keys (`sk-*`, `sk-ant-*`, `ghp_*`, `github_pat_*`, `AIza*`, `AKIA*`, `hf_*`, `xox*`), `Bearer` tokens, and URL basic-auth credentials:
+Export a self-contained monolithic JSON `model.Session` (compatible out-of-the-box with `agentfixture import -traceport <file>` and CI artifacts), a structured Markdown flight audit report, or a self-contained dark-mode interactive HTML timeline (zero external CDNs, step filters, and syntax-colored consecutive checkpoint diffs), scrubbing API keys (`sk-*`, `sk-ant-*`, `ghp_*`, `github_pat_*`, `AIza*`, `AKIA*`, `hf_*`, `xox*`), `.env` secrets, `Bearer` tokens, and URL basic-auth credentials:
 
 ```bash
 # Export portable monolithic JSON (redacted) to file or stdout
@@ -204,6 +248,9 @@ traceport export <session_id> --format json --redact --out fixture.json
 
 # Generate a Markdown flight audit report with metadata, checkpoint file deltas, and frame logs
 traceport export <session_id> --format markdown --redact --out audit_report.md
+
+# Generate a self-contained dark-mode interactive HTML timeline (always redacted & XSS-escaped)
+traceport export <session_id> --format html --out report.html
 ```
 
 ### Unified Checkpoint Diff

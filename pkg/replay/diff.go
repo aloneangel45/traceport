@@ -114,7 +114,8 @@ func (e *Engine) DiffSession(sessionID string, fromStep, toStep int, workspaceDi
 		}
 	} else {
 		toHash = "working-tree"
-		liveFiles, err := readLiveWorkspaceFiles(workDir, e.store.RootDir())
+		useIgnore := strings.HasPrefix(session.Command, "traceport watch")
+		liveFiles, err := readLiveWorkspaceFiles(workDir, e.store.RootDir(), useIgnore)
 		if err != nil {
 			return nil, err
 		}
@@ -218,7 +219,7 @@ func resolveRealDiffPath(p string) string {
 	return checkpoint.ResolveRealPath(p)
 }
 
-func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, error) {
+func readLiveWorkspaceFiles(workDir, storeRoot string, useIgnore bool) (map[string]diffBlobRef, error) {
 	absWork, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, err
@@ -226,6 +227,10 @@ func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, 
 	realWork := resolveRealDiffPath(absWork)
 	realStore := resolveRealDiffPath(storeRoot)
 	sameWorkStore := realStore != "" && sameWorkspacePath(realWork, realStore)
+	var ign *checkpoint.IgnoreMatcher
+	if useIgnore {
+		ign = checkpoint.LoadIgnoreMatcher(realWork, true)
+	}
 
 	out := make(map[string]diffBlobRef)
 	err = filepath.WalkDir(realWork, func(path string, d fs.DirEntry, walkErr error) error {
@@ -266,6 +271,20 @@ func readLiveWorkspaceFiles(workDir, storeRoot string) (map[string]diffBlobRef, 
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		if ign != nil {
+			if relOS, rErr := filepath.Rel(realWork, path); rErr == nil {
+				relSlash := filepath.ToSlash(relOS)
+				if d.IsDir() {
+					if ign.CanSkipDir(relSlash) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if ign.ShouldIgnore(relSlash, false) {
+					return nil
+				}
+			}
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
 			return nil

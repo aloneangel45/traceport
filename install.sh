@@ -88,7 +88,7 @@ if [ -z "${BASE_URL}" ]; then
     fi
 
     if [ -z "${TAG}" ]; then
-        TAG="v1.2.2"
+        TAG="v1.3.0"
         log_warn "GitHub API unavailable; falling back to release ${TAG}"
     fi
 

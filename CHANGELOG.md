@@ -5,6 +5,25 @@ All notable changes to **TracePort** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-21
+
+### Added
+- **Native Self-Healing MCP Server (`pkg/mcpserver` & `traceport mcp`):**
+  - Added a pure-Go JSON-RPC 2.0 stdio Model Context Protocol server (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `resources/list`, `prompts/list`) with automatic NDJSON and `Content-Length` wire-framing detection for Claude Code, Cursor, VS Code, Windsurf, and Antigravity.
+  - Exposed 5 core time-travel tools: `list_sessions`, `inspect_session`, `diff_checkpoints`, `search_traces`, and `rewind_workspace` (always creating the mandatory pre-rewind safety savepoint unless `dry_run=true`).
+  - Automatically passes all returned frame contents, command strings, workspace paths, search snippets, and unified checkpoint diffs through `pkg/redact` so `.env` secrets and API keys never leak into LLM contexts.
+- **One-Command IDE Preset Installer (`pkg/preset` & `traceport preset`):**
+  - Added `traceport preset <claude|cursor|vscode|windsurf> [--write] [--path <custom>] [--binary <path>] [--dry-run]` to preview or atomically merge the `"traceport"` MCP server entry into existing IDE JSON/JSONC configs while preserving other configured servers and settings.
+- **Self-Contained Interactive Dark-Mode HTML Timeline Export (`pkg/replay/html.go` & `traceport export --format html`):**
+  - Extended `traceport export <session_id> --format html [--out report.html]` to emit a zero-CDN, Catppuccin/Obsidian dark-mode interactive HTML timeline with session metadata headers, clickable step filters (`all`, `checkpoint`, `output`, `error`, `tool_call`), keyboard step navigation, redacted stdout/stderr and tool panels, and syntax-colored consecutive checkpoint unified diffs (`+` green, `-` red, `@@` cyan).
+  - Enforces automatic `pkg/redact` credential scrubbing and `html.EscapeString` escaping across all untrusted content and pre-rendered step panels (zero `innerHTML`, zero XSS).
+- **Continuous Workspace Directory Watcher (`pkg/recorder/watch.go`, `pkg/checkpoint/ignore.go`, & `traceport watch`):**
+  - Added `traceport watch [--interval 2s] [--debounce 500ms] [--max-snapshots 200] [--tag <tag>] [--dir <path>]` to continuously snapshot workspace mutations alongside AI coding IDEs.
+  - Added `.gitignore` and `.traceportignore` rule matching plus default cache/dependency filtering (`node_modules`, `.git`, `target`, `.traceport`, `.next`, `__pycache__`, `.venv`, `venv`) via `checkpoint.WithIgnoreFiltering()`, quiet-window burst coalescing (`--debounce`), tree-hash deduplication, `--max-snapshots` capping, and graceful `SIGINT`/`SIGTERM` completion.
+
+### Security
+- Expanded `pkg/redact` environment-variable secret detection to cover generic `.env` credential assignments (`*_API_KEY`, `*_SECRET_KEY`, `*_ACCESS_KEY`, `*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_PRIVATE_KEY`).
+
 ## [1.2.2] - 2026-11-15
 
 ### Fixed

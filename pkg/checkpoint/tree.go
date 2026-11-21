@@ -101,14 +101,24 @@ type TreeVerifyResult struct {
 type TreeOption func(*treeStoreConfig)
 
 type treeStoreConfig struct {
-	mode       TreeCompressionMode
-	customDict []byte
+	mode         TreeCompressionMode
+	customDict   []byte
+	ignoreFilter bool
 }
 
 // WithCompressionMode configures the compression mode used by TreeStore.
 func WithCompressionMode(mode TreeCompressionMode) TreeOption {
 	return func(cfg *treeStoreConfig) {
 		cfg.mode = mode
+	}
+}
+
+// WithIgnoreFiltering enables .gitignore, .traceportignore, and default cache/dependency
+// directory filtering (node_modules, target, .next, __pycache__, .venv, venv) during
+// workspace scans, restore planning, and rollback.
+func WithIgnoreFiltering() TreeOption {
+	return func(cfg *treeStoreConfig) {
+		cfg.ignoreFilter = true
 	}
 }
 
@@ -131,6 +141,7 @@ type TreeStore struct {
 	storeDir      string
 	realStore     string
 	mode          TreeCompressionMode
+	ignoreFilter  bool
 	compressor    *Compressor
 	statCache     map[string]statCacheEntry
 	knownBlobs    map[string]bool
@@ -194,6 +205,7 @@ func NewTreeStore(workspaceDir, storeDir string, opts ...TreeOption) (*TreeStore
 		storeDir:      absStore,
 		realStore:     realStore,
 		mode:          cfg.mode,
+		ignoreFilter:  cfg.ignoreFilter,
 		compressor:    comp,
 		statCache:     make(map[string]statCacheEntry),
 		knownBlobs:    make(map[string]bool),
@@ -441,6 +453,140 @@ func (ts *TreeStore) CreateSnapshotWithStats() (string, SnapshotStats, error) {
 	return treeHash, stats, nil
 }
 
+// WorkspaceFingerprint computes a fast, deterministic SHA-256 fingerprint of tracked workspace
+// files without writing any blobs or manifests to disk. Files modified within racyCleanWindow
+// are content-hashed so rapid same-size edits on coarse-mtime filesystems are always detected.
+func (ts *TreeStore) WorkspaceFingerprint() (string, error) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	ts.refreshRealPathsLocked()
+	workRoot := ts.realWorkspace
+	storeRoot := ts.realStore
+	storeInsideWork := isSubpath(workRoot, storeRoot) && !sameFilePath(workRoot, storeRoot)
+	sameWorkAndStore := sameFilePath(workRoot, storeRoot)
+	now := time.Now()
+	var ign *IgnoreMatcher
+	if ts.ignoreFilter {
+		ign = LoadIgnoreMatcher(workRoot, true)
+	}
+
+	type fpEntry struct {
+		rel  string
+		sig  string
+	}
+	var items []fpEntry
+
+	err := filepath.WalkDir(workRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if path == workRoot {
+			return nil
+		}
+		if storeInsideWork && (sameFilePath(path, storeRoot) || isSubpath(storeRoot, path)) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if name == ".git" || name == ".traceport" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.IsDir() && isTransientTempFile(name) {
+			return nil
+		}
+		if sameWorkAndStore {
+			if d.IsDir() && (name == "blobs" || name == "trees" || name == "dicts" || name == "sessions") {
+				return filepath.SkipDir
+			}
+			if !d.IsDir() && isInternalStoreArtifact(name) {
+				return nil
+			}
+		}
+		if IsLinkMode(d.Type()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if ign != nil {
+			if relOS, rErr := filepath.Rel(workRoot, path); rErr == nil {
+				relSlash := filepath.ToSlash(relOS)
+				if d.IsDir() {
+					if ign.CanSkipDir(relSlash) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if ign.ShouldIgnore(relSlash, false) {
+					return nil
+				}
+			}
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+		relOS, err := filepath.Rel(workRoot, path)
+		if err != nil {
+			return err
+		}
+		rel := filepath.ToSlash(relOS)
+		if err := validateRelPath(rel); err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		size := info.Size()
+		mtimeNS := info.ModTime().UnixNano()
+		normMode := normalizeFileMode(info.Mode())
+
+		var sig string
+		if isRacyModTime(now, info.ModTime()) {
+			data, _, exists, rErr := readFileConsistent(path, info)
+			if rErr != nil {
+				return rErr
+			}
+			if !exists {
+				return nil
+			}
+			sum := sha256.Sum256(data)
+			sig = fmt.Sprintf("%d:%o:%x", len(data), normMode, sum)
+		} else {
+			sig = fmt.Sprintf("%d:%d:%o", size, mtimeNS, normMode)
+		}
+		items = append(items, fpEntry{rel: rel, sig: sig})
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].rel < items[j].rel
+	})
+	h := sha256.New()
+	for _, it := range items {
+		_, _ = io.WriteString(h, it.rel)
+		_, _ = h.Write([]byte{0})
+		_, _ = io.WriteString(h, it.sig)
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func (ts *TreeStore) encodeBytesLocked(raw []byte) ([]byte, error) {
 	if ts.mode == ModeUncompressed {
 		cp := make([]byte, len(raw))
@@ -513,6 +659,10 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 	storeInsideWork := isSubpath(workRoot, storeRoot) && !sameFilePath(workRoot, storeRoot)
 	sameWorkAndStore := sameFilePath(workRoot, storeRoot)
 	now := time.Now()
+	var ign *IgnoreMatcher
+	if ts.ignoreFilter {
+		ign = LoadIgnoreMatcher(workRoot, true)
+	}
 
 	var entries []FileEntry
 
@@ -560,6 +710,21 @@ func (ts *TreeStore) scanWorkspaceLocked(stats *SnapshotStats) ([]FileEntry, err
 				return filepath.SkipDir
 			}
 			return nil
+		}
+
+		if ign != nil {
+			if relOS, rErr := filepath.Rel(workRoot, path); rErr == nil {
+				relSlash := filepath.ToSlash(relOS)
+				if d.IsDir() {
+					if ign.CanSkipDir(relSlash) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if ign.ShouldIgnore(relSlash, false) {
+					return nil
+				}
+			}
 		}
 
 		if d.IsDir() {
@@ -1114,6 +1279,10 @@ func (ts *TreeStore) listCurrentWorkspacePathsLocked() (map[string]fs.FileInfo, 
 	storeRoot := ts.realStore
 	storeInsideWork := isSubpath(workRoot, storeRoot) && !sameFilePath(workRoot, storeRoot)
 	sameWorkAndStore := sameFilePath(workRoot, storeRoot)
+	var ign *IgnoreMatcher
+	if ts.ignoreFilter {
+		ign = LoadIgnoreMatcher(workRoot, true)
+	}
 	result := make(map[string]fs.FileInfo)
 
 	err := filepath.WalkDir(workRoot, func(path string, d fs.DirEntry, walkErr error) error {
@@ -1149,6 +1318,19 @@ func (ts *TreeStore) listCurrentWorkspacePathsLocked() (map[string]fs.FileInfo, 
 			}
 			if !d.IsDir() && isInternalStoreArtifact(name) {
 				return nil
+			}
+		}
+
+		if ign != nil {
+			if relOS, rErr := filepath.Rel(workRoot, path); rErr == nil {
+				relSlash := filepath.ToSlash(relOS)
+				if d.IsDir() {
+					if ign.CanSkipDir(relSlash) {
+						return filepath.SkipDir
+					}
+				} else if ign.ShouldIgnore(relSlash, false) {
+					return nil
+				}
 			}
 		}
 
@@ -1285,6 +1467,10 @@ func (ts *TreeStore) pruneUntrackedEmptyDirsLocked() {
 	storeRoot := ts.realStore
 	storeInsideWork := isSubpath(workRoot, storeRoot) && !sameFilePath(workRoot, storeRoot)
 	sameWorkAndStore := sameFilePath(workRoot, storeRoot)
+	var ign *IgnoreMatcher
+	if ts.ignoreFilter {
+		ign = LoadIgnoreMatcher(workRoot, true)
+	}
 
 	var dirs []string
 	_ = filepath.WalkDir(workRoot, func(path string, d fs.DirEntry, walkErr error) error {
@@ -1309,6 +1495,13 @@ func (ts *TreeStore) pruneUntrackedEmptyDirsLocked() {
 		}
 		if sameWorkAndStore && d.IsDir() && (name == "blobs" || name == "trees" || name == "dicts" || name == "sessions") {
 			return filepath.SkipDir
+		}
+		if ign != nil && d.IsDir() {
+			if relOS, rErr := filepath.Rel(workRoot, path); rErr == nil {
+				if ign.CanSkipDir(filepath.ToSlash(relOS)) {
+					return filepath.SkipDir
+				}
+			}
 		}
 		if IsLinkMode(d.Type()) {
 			if d.IsDir() {

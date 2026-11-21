@@ -95,7 +95,7 @@ function Install-TracePort {
 
     if ([string]::IsNullOrEmpty($BaseUrl)) {
         if ([string]::IsNullOrEmpty($Tag)) {
-            $Tag = "v1.2.2"
+            $Tag = "v1.3.0"
             try {
                 $ReleaseJson = Invoke-TracePortDownloadString "https://api.github.com/repos/$Repo/releases/latest"
                 $Match = [System.Text.RegularExpressions.Regex]::Match($ReleaseJson, '"tag_name"\s*:\s*"([^"]+)"')

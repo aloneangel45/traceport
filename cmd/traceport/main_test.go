@@ -361,8 +361,8 @@ func TestCLI_TagsExportRedactAndSearch(t *testing.T) {
 }
 
 func TestCLI_FlagReorderingDoubleDashAndPositionalValidation(t *testing.T) {
-	if Version != "1.2.2" || displayVersion() != "v1.2.2" {
-		t.Fatalf("expected default Version=1.2.2 / v1.2.2, got Version=%q display=%q", Version, displayVersion())
+	if Version != "1.3.0" || displayVersion() != "v1.3.0" {
+		t.Fatalf("expected default Version=1.3.0 / v1.3.0, got Version=%q display=%q", Version, displayVersion())
 	}
 
 	t.Setenv("TRACEPORT_CLI_HELPER", "1")
@@ -439,6 +439,110 @@ func TestCLI_FlagReorderingDoubleDashAndPositionalValidation(t *testing.T) {
 		if code := run(inv, &out, &errBuf); code == 0 {
 			t.Fatalf("expected non-zero exit code for invalid positional args %v, got 0", inv)
 		}
+	}
+}
+
+func TestCLI_V130_PresetMCPHTMLAndWatch(t *testing.T) {
+	t.Setenv("TRACEPORT_CLI_HELPER", "1")
+	tpHome := t.TempDir()
+	t.Setenv("TRACEPORT_HOME", tpHome)
+
+	workDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(workDir, "base.go"), []byte("package demo\nconst Base = 1\n"), 0644)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origWD) }()
+
+	var out, errBuf bytes.Buffer
+
+	// 1. preset --dry-run and --write --path --binary
+	customCfg := filepath.Join(t.TempDir(), "claude_mcp.json")
+	if code := run([]string{"preset", "claude", "--dry-run", "--path", customCfg, "--binary", "/usr/local/bin/traceport"}, &out, &errBuf); code != 0 {
+		t.Fatalf("preset --dry-run failed: %s", errBuf.String())
+	}
+	if !strings.Contains(out.String(), `"traceport"`) || !strings.Contains(out.String(), `"/usr/local/bin/traceport"`) {
+		t.Fatalf("unexpected preset dry-run output:\n%s", out.String())
+	}
+	if _, err := os.Stat(customCfg); !os.IsNotExist(err) {
+		t.Fatalf("preset --dry-run must not write config file")
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"preset", "cursor", "--write", "--path", customCfg, "--binary", "/opt/traceport"}, &out, &errBuf); code != 0 {
+		t.Fatalf("preset --write failed: %s", errBuf.String())
+	}
+	writtenCfg, err := os.ReadFile(customCfg)
+	if err != nil || !strings.Contains(string(writtenCfg), `"/opt/traceport"`) {
+		t.Fatalf("preset --write did not persist expected config: err=%v content=%s", err, string(writtenCfg))
+	}
+
+	// 2. watch --max-snapshots 1 --dir <workDir> --tag cli-watch
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"watch", "--dir", workDir, "--interval", "20ms", "--debounce", "20ms", "--max-snapshots", "1", "--tag", "cli-watch"}, &out, &errBuf); code != 0 {
+		t.Fatalf("watch failed (code=%d): %s", code, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "Initial workspace snapshot") {
+		t.Fatalf("unexpected watch output:\n%s", out.String())
+	}
+
+	// 3. Record a session with secret output and export --format html --out
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"record", "--tag", "html-e2e", "--", os.Args[0], "-test.run=TestCLIHelperProcess", "--", "secret_run"}, &out, &errBuf); code != 0 {
+		t.Fatalf("record secret_run failed: %s", errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"list", "--tag", "html-e2e", "--json"}, &out, &errBuf); code != 0 {
+		t.Fatalf("list --tag html-e2e failed: %s", errBuf.String())
+	}
+	var sessions []model.Session
+	if err := json.Unmarshal(out.Bytes(), &sessions); err != nil || len(sessions) != 1 {
+		t.Fatalf("expected 1 html-e2e session, got %d (err=%v)", len(sessions), err)
+	}
+	sessID := sessions[0].ID
+
+	htmlPath := filepath.Join(t.TempDir(), "report.html")
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"export", sessID, "--format", "html", "--out", htmlPath}, &out, &errBuf); code != 0 {
+		t.Fatalf("export --format html failed: %s", errBuf.String())
+	}
+	htmlBytes, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("read exported html: %v", err)
+	}
+	htmlStr := string(htmlBytes)
+	if !strings.Contains(htmlStr, "<!DOCTYPE html>") || !strings.Contains(htmlStr, "audit_target.go") || !strings.Contains(htmlStr, "[REDACTED]") {
+		t.Fatalf("unexpected HTML export content")
+	}
+	if strings.Contains(htmlStr, "SecretTestKey1234567890") {
+		t.Fatalf("secret leaked in HTML CLI export")
+	}
+
+	// 4. mcp subcommand stdio initialize + tools/list
+	mcpReq := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+	}, "\n") + "\n"
+	out.Reset()
+	errBuf.Reset()
+	if code := runWithIO([]string{"mcp"}, strings.NewReader(mcpReq), &out, &errBuf); code != 0 {
+		t.Fatalf("mcp failed (code=%d): %s", code, errBuf.String())
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"traceport"`) || !strings.Contains(lines[1], `"rewind_workspace"`) {
+		t.Fatalf("unexpected mcp stdout:\n%s", out.String())
 	}
 }
 

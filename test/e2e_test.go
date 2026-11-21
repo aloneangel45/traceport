@@ -329,7 +329,7 @@ func TestInstallerPS1_RestrictedPSModulePathEndToEnd(t *testing.T) {
 	}
 
 	verOut, err := exec.Command(destExe, "version").CombinedOutput()
-	if err != nil || strings.TrimSpace(string(verOut)) != "traceport v1.2.2" {
+	if err != nil || strings.TrimSpace(string(verOut)) != "traceport v1.3.0" {
 		t.Fatalf("installed traceport.exe version check failed: err=%v out=%q", err, string(verOut))
 	}
 

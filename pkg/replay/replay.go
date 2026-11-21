@@ -92,7 +92,11 @@ func (e *Engine) RewindWithOptions(sessionID string, targetStep int, workspaceDi
 		DryRun:       opts.DryRun,
 	}
 
-	treeStore, err := checkpoint.NewTreeStore(absWork, e.store.RootDir())
+	var treeOpts []checkpoint.TreeOption
+	if strings.HasPrefix(session.Command, "traceport watch") {
+		treeOpts = append(treeOpts, checkpoint.WithIgnoreFiltering())
+	}
+	treeStore, err := checkpoint.NewTreeStore(absWork, e.store.RootDir(), treeOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("open shadow-tree store: %w", err)
 	}

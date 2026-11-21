@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -8,26 +9,30 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/aloneangel45/traceport/pkg/checkpoint"
+	"github.com/aloneangel45/traceport/pkg/mcpserver"
 	"github.com/aloneangel45/traceport/pkg/model"
+	"github.com/aloneangel45/traceport/pkg/preset"
 	"github.com/aloneangel45/traceport/pkg/recorder"
 	"github.com/aloneangel45/traceport/pkg/replay"
 	"github.com/aloneangel45/traceport/pkg/storage"
 )
 
 // Version is injected at link time via -ldflags "-X main.Version=...".
-var Version = "1.2.2"
+var Version = "1.3.0"
 
 func displayVersion() string {
 	v := strings.TrimSpace(Version)
 	if v == "" {
-		return "v1.2.2"
+		return "v1.3.0"
 	}
 	if strings.HasPrefix(v, "v") {
 		return v
@@ -47,10 +52,14 @@ func (s *stringSliceFlag) Set(val string) error {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(runWithIO(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithIO(args, os.Stdin, stdout, stderr)
+}
+
+func runWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		printBanner(stdout)
 		printUsage(stdout)
@@ -58,6 +67,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	command := strings.ToLower(args[0])
+	subArgs := args[1:]
 	switch command {
 	case "help", "-h", "--help":
 		printBanner(stdout)
@@ -66,6 +76,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "traceport %s\n", displayVersion())
 		return 0
+	case "preset":
+		return handlePreset(subArgs, stdout, stderr)
+	case "watch":
+		return handleWatch(subArgs, stdout, stderr)
 	}
 
 	store, err := storage.NewStore()
@@ -74,10 +88,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	subArgs := args[1:]
 	switch command {
 	case "record":
 		return handleRecord(store, subArgs, stdout, stderr)
+	case "mcp":
+		return handleMCP(store, subArgs, stdin, stdout, stderr)
 	case "list", "ls", "sessions":
 		return handleList(store, subArgs, stdout, stderr)
 	case "tag":
@@ -117,10 +132,13 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Core Commands:")
 	fmt.Fprintln(out, "  record [--tag <tag>] -- <cmd> [args...]   Record an agent or CLI execution session")
+	fmt.Fprintln(out, "  watch [--interval 2s] [--debounce 500ms]  Continuously watch workspace and checkpoint changes")
+	fmt.Fprintln(out, "  mcp                                       Start native JSON-RPC 2.0 stdio MCP server")
+	fmt.Fprintln(out, "  preset <claude|cursor|vscode|windsurf>    Generate or merge IDE MCP server configuration")
 	fmt.Fprintln(out, "  list | sessions [--tag <tag>] [--json]    List recorded flight sessions")
 	fmt.Fprintln(out, "  tag <session_id> <tag...> [--remove]      Add or remove tags on an existing session")
 	fmt.Fprintln(out, "  inspect <session_id> [--json]             Inspect session frames and metadata")
-	fmt.Fprintln(out, "  export <session_id> [--format json|md]    Export portable session JSON or audit report")
+	fmt.Fprintln(out, "  export <session_id> [--format json|md|html] Export JSON, Markdown, or interactive HTML timeline")
 	fmt.Fprintln(out, "  search <query> [--regex] [--tag <tag>]    Search across commands, frames, and checkpoints")
 	fmt.Fprintln(out, "  rewind <session_id> --step <N> [flags]    Roll back workspace and timeline to step N")
 	fmt.Fprintln(out, "  replay <session_id> [--from <N>]          Deterministic zero-token session playback")
@@ -508,13 +526,13 @@ func handleInspect(store *storage.Store, args []string, stdout, stderr io.Writer
 
 func handleExport(store *storage.Store, args []string, stdout, stderr io.Writer) int {
 	if isHelpArg(args) {
-		fmt.Fprintln(stdout, "Usage: traceport export <session_id> [--format json|markdown] [--out <path>] [--redact]")
+		fmt.Fprintln(stdout, "Usage: traceport export <session_id> [--format json|markdown|html] [--out <path>] [--redact]")
 		return 0
 	}
 
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	format := fs.String("format", "json", "Export format: json or markdown (md)")
+	format := fs.String("format", "json", "Export format: json, markdown (md), or html")
 	outPath := fs.String("out", "", "Destination file path (defaults to stdout)")
 	redactFlag := fs.Bool("redact", false, "Scrub API keys, bearer tokens, and URL credentials")
 
@@ -523,7 +541,7 @@ func handleExport(store *storage.Store, args []string, stdout, stderr io.Writer)
 		return 1
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintln(stderr, "[err] usage: traceport export <session_id> [--format json|markdown] [--out <path>] [--redact]")
+		fmt.Fprintln(stderr, "[err] usage: traceport export <session_id> [--format json|markdown|html] [--out <path>] [--redact]")
 		return 1
 	}
 
@@ -1001,5 +1019,178 @@ func handleDict(store *storage.Store, args []string, stdout, stderr io.Writer) i
 		stats.Duration.Round(time.Millisecond),
 	)
 	fmt.Fprintf(stdout, "[traceport] persisted dictionary: %s\n", stats.DictPath)
+	return 0
+}
+
+func handleMCP(store *storage.Store, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if isHelpArg(args) {
+		fmt.Fprintln(stdout, "Usage: traceport mcp")
+		fmt.Fprintln(stdout, "Start TracePort's native JSON-RPC 2.0 stdio Model Context Protocol (MCP) server.")
+		return 0
+	}
+
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintln(stderr, "[err] usage: traceport mcp")
+		return 1
+	}
+
+	cwd, _ := os.Getwd()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := mcpserver.New(store, cwd, strings.TrimPrefix(displayVersion(), "v"))
+	if err := srv.ServeStdio(ctx, stdin, stdout); err != nil {
+		fmt.Fprintf(stderr, "[err] mcp server failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func handlePreset(args []string, stdout, stderr io.Writer) int {
+	if isHelpArg(args) {
+		fmt.Fprintln(stdout, "Usage: traceport preset <claude|cursor|vscode|windsurf> [--write] [--path <custom>] [--binary <path>] [--dry-run]")
+		return 0
+	}
+
+	fs := flag.NewFlagSet("preset", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	writeFlag := fs.Bool("write", false, "Atomically write/merge configuration into the IDE MCP config file")
+	customPath := fs.String("path", "", "Override destination MCP config file path")
+	binaryPath := fs.String("binary", "", "Override path to the traceport binary")
+	dryRun := fs.Bool("dry-run", false, "Preview merged JSON configuration without modifying disk")
+
+	ordered := reorderFlagsFirst(args, map[string]bool{"path": true, "binary": true})
+	if err := fs.Parse(ordered); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "[err] usage: traceport preset <claude|cursor|vscode|windsurf> [--write] [--path <custom>] [--binary <path>] [--dry-run]")
+		return 1
+	}
+
+	client, err := preset.ParseClient(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] %v\n", err)
+		return 1
+	}
+
+	bin := strings.TrimSpace(*binaryPath)
+	if bin == "" {
+		if exe, exeErr := os.Executable(); exeErr == nil && exe != "" {
+			bin = exe
+		} else {
+			bin = "traceport"
+		}
+	}
+
+	targetPath := strings.TrimSpace(*customPath)
+	if targetPath == "" {
+		targetPath, err = preset.DefaultConfigPath(client, "")
+		if err != nil {
+			fmt.Fprintf(stderr, "[err] resolve default config path: %v\n", err)
+			return 1
+		}
+	}
+
+	if *writeFlag && !*dryRun {
+		if _, err := preset.Apply(client, targetPath, bin); err != nil {
+			fmt.Fprintf(stderr, "[err] failed writing preset for %s: %v\n", client, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "[ok] configured traceport MCP preset for %s -> %s\n", client, targetPath)
+		return 0
+	}
+
+	merged, err := preset.Preview(client, targetPath, bin)
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] failed generating preset for %s: %v\n", client, err)
+		return 1
+	}
+	if _, err := stdout.Write(merged); err != nil {
+		fmt.Fprintf(stderr, "[err] write preset output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func handleWatch(args []string, stdout, stderr io.Writer) int {
+	if isHelpArg(args) {
+		fmt.Fprintln(stdout, "Usage: traceport watch [--interval 2s] [--debounce 500ms] [--max-snapshots 200] [--tag <tag>] [--dir <path>]")
+		return 0
+	}
+
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	interval := fs.Duration("interval", recorder.DefaultWatchInterval, "Workspace polling interval")
+	debounce := fs.Duration("debounce", recorder.DefaultWatchDebounce, "Quiet window to coalesce rapid burst edits")
+	maxSnapshots := fs.Int("max-snapshots", recorder.DefaultWatchMaxSnapshots, "Maximum checkpoints to record before completing")
+	dirFlag := fs.String("dir", "", "Target workspace directory to watch (defaults to current working directory)")
+	var tagFlags stringSliceFlag
+	fs.Var(&tagFlags, "tag", "Attach session tag (repeatable or comma-separated)")
+
+	ordered := reorderFlagsFirst(args, map[string]bool{
+		"interval":      true,
+		"debounce":      true,
+		"max-snapshots": true,
+		"tag":           true,
+		"dir":           true,
+	})
+	if err := fs.Parse(ordered); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintln(stderr, "[err] usage: traceport watch [--interval 2s] [--debounce 500ms] [--max-snapshots 200] [--tag <tag>] [--dir <path>]")
+		return 1
+	}
+	if *interval <= 0 {
+		fmt.Fprintf(stderr, "[err] --interval must be positive (got %s)\n", *interval)
+		return 1
+	}
+	if *debounce < 0 {
+		fmt.Fprintf(stderr, "[err] --debounce must be non-negative (got %s)\n", *debounce)
+		return 1
+	}
+	if *maxSnapshots <= 0 {
+		fmt.Fprintf(stderr, "[err] --max-snapshots must be positive (got %d)\n", *maxSnapshots)
+		return 1
+	}
+
+	watchDir := strings.TrimSpace(*dirFlag)
+	if watchDir == "" {
+		var err error
+		watchDir, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(stderr, "[err] cannot determine working directory: %v\n", err)
+			return 1
+		}
+	}
+
+	store, err := storage.NewStoreWithPath(storage.ResolveStoreDir(watchDir))
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] failed to initialize storage: %v\n", err)
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	_, err = recorder.Watch(ctx, store, recorder.WatchOptions{
+		Dir:          watchDir,
+		Interval:     *interval,
+		Debounce:     *debounce,
+		MaxSnapshots: *maxSnapshots,
+		Tags:         tagFlags,
+		Stdout:       stdout,
+		Stderr:       stderr,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "[err] watch failed: %v\n", err)
+		return 1
+	}
 	return 0
 }
